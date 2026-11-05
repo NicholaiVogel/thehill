@@ -1,0 +1,19 @@
+[package]
+name = "sisyphus"
+version = "0.1.0"
+edition = "2024"
+description = "A typing trainer whose difficulty is a neural network that learns your weaknesses."
+
+[dependencies]
+anyhow = "1"
+chrono = "0.4"
+dirs = "6"
+gpui = "0.2"
+rand = "0.9"
+rusqlite = { version = "0.37", features = ["bundled"] }
+
+[profile.dev]
+opt-level = 2
+
+[profile.dev.package."*"]
+opt-level = 3

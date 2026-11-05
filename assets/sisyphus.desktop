@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Sisyphus
+GenericName=Typing Trainer
+Comment=Typing practice that learns your weak keystrokes
+Exec=/home/nicholai/.cargo/bin/sisyphus
+Icon=sisyphus
+Terminal=false
+Categories=Education;
+Keywords=typing;wpm;monkeytype;
+StartupWMClass=sisyphus
