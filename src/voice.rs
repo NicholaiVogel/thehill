@@ -1,7 +1,7 @@
 //! The hill's voice: short lines that tell you how you're doing, in the tone of an
 //! opponent who would like you to do worse. Every line is built from real numbers.
 
-use rand::{SeedableRng, rngs::StdRng, seq::IndexedRandom};
+use rand::{Rng, SeedableRng, rngs::StdRng, seq::IndexedRandom};
 use std::collections::VecDeque;
 
 /// Templates said recently are skipped, so the same line doesn't come round for a while.
@@ -34,6 +34,15 @@ pub fn outcome(wpm: f64, predicted: f64) -> std::cmp::Ordering {
     }
 }
 
+/// A word you typed in this run and long ago, with your time per letter on it then and now.
+pub struct Memory {
+    pub word: String,
+    /// "Nov 5", or "34 runs ago" when it was today.
+    pub when: String,
+    pub then_ms: f64,
+    pub now_ms: f64,
+}
+
 pub struct RunFacts {
     pub wpm: f64,
     pub raw: f64,
@@ -55,6 +64,8 @@ pub struct RunFacts {
     pub hour: u32,
     /// Date of the checkpoint played against, if not the live model.
     pub checkpoint: Option<String>,
+    pub boss: bool,
+    pub memory: Option<Memory>,
 }
 
 const COLD: &[&str] = &[
@@ -198,6 +209,50 @@ const BEAT_OLD: &[&str] = &[
 
 const LOST_OLD: &[&str] = &["even me from {date} got you.", "i had your number back on {date}. i still do."];
 
+const BOSS_PREVIEW: &[&str] = &[
+    "boss run. 25 words, all {t}. this one guards the checkpoint.",
+    "every tenth run is mine. {t}, all the way down.",
+    "boss. i built this out of {t}. take your time. it's timed.",
+    "this is the one i've been saving. {t}.",
+    "checkpoint's behind me. {t} first.",
+];
+
+const BOSS_BEAT: &[&str] = &[
+    "{wpm} on my boss run. i'll need a bigger one.",
+    "you got through. the next boss has read this one.",
+    "{d}% over, on my best material. noted, with some respect.",
+    "fine. the checkpoint's yours. the next boss isn't.",
+    "you beat the boss. i'm a hill, i've had worse days. not many.",
+];
+
+const BOSS_MATCH: &[&str] = &[
+    "a draw with the boss. {wpm} to my {pred}. we'll call it a stalemate.",
+    "even. the boss and you, exactly matched. i'll fix that.",
+    "dead heat on the boss run. neither of us blinked.",
+];
+
+const BOSS_LOSE: &[&str] = &[
+    "the boss holds. {wpm}, i said {pred}.",
+    "{d}% under on the boss. that's what it's for.",
+    "boss run: mine. see you in ten.",
+    "you'll meet those words again. they'll meet you first.",
+    "that's the wall. it'll be here next time too.",
+];
+
+const MEMORY_FASTER: &[&str] = &[
+    "'{w}': {then}ms a letter on {when}. {now} today. i remember.",
+    "{when} you typed '{w}' at {then}ms a letter. {now} now. don't let it go to your head.",
+    "i kept '{w}' from {when}. {then}ms a letter then, {now} now. annoying.",
+    "'{w}' used to cost you {then}ms a letter. that was {when}. it's {now} now.",
+];
+
+const MEMORY_SLOWER: &[&str] = &[
+    "'{w}': {then}ms a letter on {when}. {now} today. going backwards?",
+    "{when} you did '{w}' at {then}ms a letter. today {now}. i remember things.",
+    "'{w}' was easier for you {when}. {then}ms then, {now} now.",
+    "you were faster on '{w}' {when}. i have it written down.",
+];
+
 const PLANTED: &[&str] = &[
     "{n} '{t}'s in this one. on purpose.",
     "this one's built around '{t}'.",
@@ -294,6 +349,9 @@ impl Voice {
         ];
         let verdict = match outcome(f.wpm, f.predicted) {
             _ if f.predicted <= 0.0 => self.pick(COLD),
+            std::cmp::Ordering::Greater if f.boss => self.pick(BOSS_BEAT),
+            std::cmp::Ordering::Equal if f.boss => self.pick(BOSS_MATCH),
+            std::cmp::Ordering::Less if f.boss => self.pick(BOSS_LOSE),
             std::cmp::Ordering::Greater => self.pick(BEAT),
             std::cmp::Ordering::Equal => self.pick(MATCH),
             std::cmp::Ordering::Less => self.pick(LOSE),
@@ -310,7 +368,13 @@ impl Voice {
         } else {
             None
         };
-        let note = milestone.or_else(|| {
+        // A word you also typed long ago comes up about half the time it's available.
+        let memory = f.memory.as_ref().filter(|_| milestone.is_none() && self.rng.random_bool(0.5)).map(|m| {
+            let pool = if m.now_ms < m.then_ms { MEMORY_FASTER } else { MEMORY_SLOWER };
+            let vals = [("w", m.word.clone()), ("when", m.when.clone()), ("then", n(m.then_ms)), ("now", n(m.now_ms))];
+            fill(self.pick(pool), &vals)
+        });
+        let note = milestone.or(memory).or_else(|| {
             let mut kinds: Vec<&'static [&'static str]> = Vec::new();
             if f.errors == 0 && f.accuracy > 0.0 {
                 kinds.push(CLEAN);
@@ -379,6 +443,16 @@ impl Voice {
         fill(self.pick(kind), &vals)
     }
 
+    pub fn boss_preview(&mut self, tags: &[String]) -> String {
+        let quoted: Vec<String> = tags.iter().map(|t| format!("'{}'", show(t))).collect();
+        let t = match quoted.as_slice() {
+            [] => "everything you hate".to_string(),
+            [one] => one.clone(),
+            [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+        };
+        fill(self.pick(BOSS_PREVIEW), &[("t", t)])
+    }
+
     /// `runs_left` must be positive.
     pub fn cold_preview(&mut self, runs_left: i64) -> String {
         fill(self.pick(COLD_PREVIEW), &[("n", runs_left.to_string())])
@@ -440,6 +514,8 @@ mod tests {
             runs_today: 25,
             hour: 2,
             checkpoint: Some("Nov 5".into()),
+            boss: false,
+            memory: Some(Memory { word: "pueblo".into(), when: "Nov 5".into(), then_ms: 210.0, now_ms: 140.0 }),
         }
     }
 

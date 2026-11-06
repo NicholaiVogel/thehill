@@ -43,6 +43,36 @@ impl Mode {
 
 pub type Opponent = (Arc<Model>, Arc<WordCosts>);
 
+/// Boss runs: every `CHECKPOINT_EVERY`th run against the live hill, this many words long.
+pub const BOSS_WORDS: u32 = 25;
+/// The ghost is you as the checkpoint frozen about this many runs ago.
+const GHOST_RUNS_BACK: i64 = 50;
+/// The hill only brings up a word from a run at least this many runs back.
+const MEMORY_RUNS_BACK: i64 = 20;
+/// ...and only when your time per letter on it changed by at least this much.
+const MEMORY_MIN_CHANGE: f64 = 0.15;
+
+/// A past version of you, typing this run's text at the pace an old checkpoint expects.
+pub struct Ghost {
+    /// "Nov 5 · run 130".
+    pub label: String,
+    /// When the ghost types each char, in ms from the first keystroke.
+    pub pace: Vec<f32>,
+    pub wpm: f64,
+}
+
+/// What the results graph plots: cumulative wpm over the run for you, the hill's committed
+/// pace, and the ghost; when you made mistakes; and the word that cost you the most.
+pub struct Graph {
+    pub seconds: f32,
+    pub you: Vec<(f32, f32)>,
+    pub hill: Vec<(f32, f32)>,
+    pub ghost: Vec<(f32, f32)>,
+    pub errors: Vec<f32>,
+    /// The word you lost the most time on against the hill's pace, and how much (ms).
+    pub lost: Option<(String, f64)>,
+}
+
 pub struct Run {
     pub test: Test,
     pub generator: Generator,
@@ -57,6 +87,10 @@ pub struct Run {
     /// The opponent's wpm prediction, committed and shown before the run starts; the run is
     /// judged against exactly this number. 0 without an opponent.
     pub predicted: f64,
+    /// When the opponent expects you to type each char, in ms from the first keystroke.
+    pub pace: Vec<f32>,
+    pub ghost: Option<Ghost>,
+    pub boss: bool,
 }
 
 impl Run {
@@ -90,6 +124,10 @@ pub struct Finished {
     /// The live model's current top weaknesses, and the last checkpoint's that dropped out.
     pub struggling: Vec<String>,
     pub improved: Vec<String>,
+    pub graph: Graph,
+    /// The ghost's label and the wpm it would have scored.
+    pub ghost: Option<(String, f64)>,
+    pub boss: bool,
 }
 
 pub struct Session {
@@ -106,6 +144,10 @@ pub struct Session {
     pub voice: Voice,
     /// Recent words, newest first, that rest before the hill uses them again.
     resting: Vec<String>,
+    /// Show a past you racing alongside.
+    pub ghost: bool,
+    /// The ghost's checkpoint, cached: (id, label, model).
+    ghost_model: Option<(i64, String, Arc<Model>)>,
     seed: u64,
 }
 
@@ -120,6 +162,7 @@ impl Session {
         let opponent_id = store.setting("opponent").and_then(|s| s.parse().ok());
         let live = learn::load_live(&store);
         let history = store.setting("voice").unwrap_or_default();
+        let ghost = store_flag_default_on(&store, "ghost");
         let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos() as u64;
         let mut session = Session {
             store,
@@ -132,6 +175,8 @@ impl Session {
             live,
             voice: Voice::new(seed, &history),
             resting: Vec::new(),
+            ghost,
+            ghost_model: None,
             seed,
         };
         session.refresh_resting()?;
@@ -144,6 +189,7 @@ impl Session {
         self.store.set_setting("numbers", if self.options.numbers { "1" } else { "0" })?;
         self.store.set_setting("mode", &self.mode.encode())?;
         self.store.set_setting("hill", if self.hill { "1" } else { "0" })?;
+        self.store.set_setting("ghost", if self.ghost { "1" } else { "0" })?;
         let opponent = self.opponent_id.map(|id| id.to_string()).unwrap_or_default();
         self.store.set_setting("opponent", &opponent)
     }
@@ -163,38 +209,82 @@ impl Session {
         Ok(())
     }
 
+    /// Whether the next run is a boss: the one that completes each block of
+    /// `CHECKPOINT_EVERY`, against the live hill. Retrying or skipping doesn't dodge it.
+    fn boss_due(&self, runs: i64) -> bool {
+        self.hill && self.opponent_id.is_none() && runs >= COLD_RUNS && (runs + 1) % learn::CHECKPOINT_EVERY == 0
+    }
+
     pub fn new_run(&mut self) -> Result<Run> {
         self.seed = self.seed.wrapping_add(1);
         let runs = self.store.run_count()?;
         let opponent = self.opponent.clone().filter(|_| self.hill && runs >= COLD_RUNS);
+        let boss = opponent.is_some() && self.boss_due(runs);
+        let mode = if boss { Mode::Words(BOSS_WORDS) } else { self.mode };
         let rest: &[String] = if opponent.is_some() { &self.resting } else { &[] };
         let mut generator = Generator::new(opponent.clone(), self.options, rest, self.seed);
-        let test = Test::new(generator.take(self.mode.initial_words()));
+        let mut targets = Vec::new();
+        if let (true, Some((m, _))) = (boss, &opponent) {
+            generator = generator.boss(&learn::weaknesses(m, 12));
+            targets = generator.boss_targets().to_vec();
+        }
+        let test = Test::new(generator.take(mode.initial_words()));
         let weak = opponent.as_ref().map(|(m, _)| learn::weaknesses(m, 6)).unwrap_or_default();
         let preview = match &opponent {
             _ if !self.hill => String::new(),
             None if runs < COLD_RUNS => self.voice.cold_preview(COLD_RUNS - runs),
             // Enough runs but no usable model (deleted or corrupt): nothing honest to say yet.
             None => String::new(),
+            Some(_) if boss => self.voice.boss_preview(&targets),
             Some((model, _)) => self.preview(model, &test, &weak),
         };
         self.save_voice();
         let text: Vec<char> = test.text().chars().collect();
-        let predicted = match (&self.opponent, self.mode) {
-            (Some((m, _)), Mode::Words(_)) => wpm_from_costs(&m.costs(&text)),
-            (Some((m, _)), Mode::Time(s)) => wpm_from_costs(expected_reach(&m.costs(&text), s)),
-            (None, _) => 0.0,
+        let commit = |m: &Model| {
+            let costs = m.costs(&text);
+            let wpm = match mode {
+                Mode::Words(_) => wpm_from_costs(&costs),
+                Mode::Time(s) => wpm_from_costs(expected_reach(&costs, s)),
+            };
+            (wpm, pace(&costs))
         };
+        let (predicted, pace) = self.opponent.as_ref().map(|(m, _)| commit(m)).unwrap_or_default();
+        let ghost = if self.ghost && opponent.is_some() { self.ghost_model(runs)? } else { None };
+        let ghost = ghost.map(|(label, m)| {
+            let (wpm, pace) = commit(&m);
+            Ghost { label, pace, wpm }
+        });
         Ok(Run {
             predicted,
+            pace,
+            ghost,
+            boss,
             test,
             generator,
-            mode: self.mode,
+            mode,
             opponent_id: self.opponent_id,
             weak,
             preview,
             hill: self.hill,
         })
+    }
+
+    /// The checkpoint frozen about `GHOST_RUNS_BACK` runs ago, or the oldest one if there
+    /// isn't one that far back yet. `None` until a checkpoint is at least 10 runs old.
+    fn ghost_model(&mut self, runs: i64) -> Result<Option<(String, Arc<Model>)>> {
+        let checkpoints = self.store.checkpoints()?;
+        let old_enough = checkpoints.iter().filter(|c| c.run_count + learn::CHECKPOINT_EVERY <= runs);
+        let pick = old_enough
+            .clone()
+            .filter(|c| c.run_count <= runs - GHOST_RUNS_BACK)
+            .next_back()
+            .or_else(|| old_enough.min_by_key(|c| c.run_count));
+        let Some(c) = pick else { return Ok(None) };
+        if self.ghost_model.as_ref().map(|g| g.0) != Some(c.id) {
+            let Some(model) = learn::load_checkpoint(&self.store, c.id)? else { return Ok(None) };
+            self.ghost_model = Some((c.id, format!("{} · run {}", c.date(), c.run_count), Arc::new(model)));
+        }
+        Ok(self.ghost_model.as_ref().map(|g| (g.1.clone(), g.2.clone())))
     }
 
     fn preview(&mut self, model: &Model, test: &Test, weak: &[String]) -> String {
@@ -240,9 +330,11 @@ impl Session {
                 accuracy: score.accuracy,
                 predicted,
                 hill: run.hill,
+                boss: run.boss,
             },
             &run.test.events,
         )?;
+        let run_id = self.store.last_run_id()?;
         self.refresh_resting()?;
 
         let slowest = slowest(&run.test, 5);
@@ -260,7 +352,9 @@ impl Session {
             predicted,
             accuracy: score.accuracy,
             errors: score.errors,
-            personal_best: best_before.is_some_and(|b| score.wpm > b),
+            personal_best: !run.boss && best_before.is_some_and(|b| score.wpm > b),
+            boss: run.boss,
+            memory: if run.hill { self.memory(&run.test, run_id)? } else { None },
             streak: if predicted > 0.0 { streak(&self.store.recent_results(usize::MAX)?) } else { 0 },
             slowest: slowest.first().copied(),
             worst_word: worst_word(&run.test),
@@ -282,7 +376,64 @@ impl Session {
             }
             None => (Vec::new(), Vec::new()),
         };
-        Ok(Finished { score, predicted, mode: run.mode, slowest, lines, struggling, improved })
+        let seconds = match run.mode {
+            Mode::Words(_) => run.test.elapsed_ms() / 1000.0,
+            Mode::Time(s) => s as f64,
+        } as f32;
+        let ghost_pace = run.ghost.as_ref().map(|g| g.pace.as_slice());
+        let graph = graph(&run.test, &run.pace, ghost_pace, seconds);
+        let ghost = run.ghost.as_ref().map(|g| (g.label.clone(), g.wpm));
+        Ok(Finished {
+            score,
+            predicted,
+            mode: run.mode,
+            slowest,
+            lines,
+            struggling,
+            improved,
+            graph,
+            ghost,
+            boss: run.boss,
+        })
+    }
+
+    /// A word from this run you also typed long ago, when your time per letter on it has
+    /// changed a lot since: the one that changed the most.
+    fn memory(&self, test: &Test, run_id: i64) -> Result<Option<voice::Memory>> {
+        let now = word_speeds(&test.words, &test.events);
+        let mut best: Option<voice::Memory> = None;
+        let mut seen = std::collections::HashSet::new();
+        for (w, ms) in test.words.iter().zip(now) {
+            let word = crate::generator::bare(&w.iter().collect::<String>());
+            let Some(now_ms) = ms else { continue };
+            if word.len() < 4 || !seen.insert(word.clone()) {
+                continue;
+            }
+            // The earliest past run where you actually typed it cleanly.
+            let mut found = None;
+            for id in self.store.runs_with(&word, run_id - MEMORY_RUNS_BACK)? {
+                let past = self.store.past_run(id)?;
+                let text: String = past.log.text.iter().collect();
+                let words: Vec<Vec<char>> = text.split(' ').map(|w| w.chars().collect()).collect();
+                let then = words
+                    .iter()
+                    .zip(word_speeds(&words, &past.log.events))
+                    .find_map(|(w, ms)| ms.filter(|_| crate::generator::bare(&w.iter().collect::<String>()) == word));
+                if let Some(then_ms) = then {
+                    found = Some((past, then_ms));
+                    break;
+                }
+            }
+            let Some((past, then_ms)) = found else { continue };
+            let change = (now_ms / then_ms - 1.0).abs();
+            if change >= MEMORY_MIN_CHANGE && best.as_ref().is_none_or(|b| change > (b.now_ms / b.then_ms - 1.0).abs())
+            {
+                let today = chrono::Local::now().format("%b %-d").to_string();
+                let when = if past.date() == today { format!("{} runs ago", run_id - past.id) } else { past.date() };
+                best = Some(voice::Memory { word, when, then_ms, now_ms });
+            }
+        }
+        Ok(best)
     }
 
     /// Persists which lines the hill has said, so a restart doesn't bring them straight back.
@@ -396,36 +547,125 @@ fn slowest(test: &Test, n: usize) -> Vec<(char, char, f64)> {
     best
 }
 
-/// The word (3+ letters, typed without a single mistake) with the most time per letter.
-/// Each letter's time is its first clean interval; the run's very first keystroke has none.
-fn worst_word(test: &Test) -> Option<(String, f64)> {
+/// Per word: mean time per letter if it was typed without a single mistake and every letter
+/// has a clean interval (the run's very first keystroke has none); `None` otherwise.
+fn word_speeds(words: &[Vec<char>], events: &[Event]) -> Vec<Option<f64>> {
     let mut spans = Vec::new();
     let mut start = 0;
-    for w in &test.words {
+    for w in words {
         spans.push(start..start + w.len());
         start += w.len() + 1;
     }
     let word_of = |idx: usize| spans.iter().position(|s| s.contains(&idx));
     let mut flawed = vec![false; spans.len()];
-    for e in test.events.iter().filter(|e| !e.correct) {
+    for e in events.iter().filter(|e| !e.correct) {
         if let Some(i) = word_of(e.idx) {
             flawed[i] = true;
         }
     }
     let mut timed: Vec<std::collections::HashMap<usize, f64>> = vec![Default::default(); spans.len()];
-    for (e, ms) in clean_intervals(&test.events) {
+    for (e, ms) in clean_intervals(events) {
         if let Some(i) = word_of(e.idx) {
             timed[i].entry(e.idx).or_insert(ms);
         }
     }
     (0..spans.len())
-        .filter(|&i| spans[i].len() >= 3 && !flawed[i])
-        .filter(|&i| timed[i].len() == spans[i].len() - usize::from(spans[i].start == 0))
         .map(|i| {
-            let per_letter = timed[i].values().sum::<f64>() / timed[i].len() as f64;
-            (test.words[i].iter().collect::<String>(), per_letter)
+            let complete = !spans[i].is_empty()
+                && !flawed[i]
+                && timed[i].len() == spans[i].len() - usize::from(spans[i].start == 0);
+            complete.then(|| timed[i].values().sum::<f64>() / timed[i].len() as f64)
         })
+        .collect()
+}
+
+/// The word (3+ letters, typed without a single mistake) with the most time per letter.
+fn worst_word(test: &Test) -> Option<(String, f64)> {
+    test.words
+        .iter()
+        .zip(word_speeds(&test.words, &test.events))
+        .filter(|(w, _)| w.len() >= 3)
+        .filter_map(|(w, ms)| Some((w.iter().collect::<String>(), ms?)))
         .max_by(|a, b| a.1.total_cmp(&b.1))
+}
+
+/// Cumulative time at which each char is typed, given per-keystroke costs; the first is free.
+fn pace(costs: &[f32]) -> Vec<f32> {
+    let mut t = 0.0;
+    costs
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            if i > 0 {
+                t += c;
+            }
+            t
+        })
+        .collect()
+}
+
+const GRAPH_POINTS: usize = 40;
+/// Cumulative wpm is noise before this.
+const GRAPH_START_S: f32 = 0.5;
+
+fn graph(test: &Test, hill: &[f32], ghost: Option<&[f32]>, seconds: f32) -> Graph {
+    // Your progress: the chars that count toward wpm after each keystroke, exactly as scored.
+    let progress: Vec<(f32, usize)> = test.progress().into_iter().map(|(t, c)| (t as f32, c)).collect();
+    let you_at = |t: f32| progress.iter().take_while(|r| r.0 <= t).last().map_or(0, |r| r.1);
+    let paced = |pace: &[f32], t: f32| pace.partition_point(|&p| p <= t);
+    let wpm = |chars: usize, t: f32| chars as f32 / 5.0 / (t / 60_000.0);
+    let times: Vec<f32> = (1..=GRAPH_POINTS)
+        .map(|k| seconds * 1000.0 * k as f32 / GRAPH_POINTS as f32)
+        .filter(|&t| t >= GRAPH_START_S * 1000.0)
+        .collect();
+    let line = |at: &dyn Fn(f32) -> usize| times.iter().map(|&t| (t / 1000.0, wpm(at(t), t))).collect();
+    // A pace that finishes the text early ends there, instead of drooping as if it slowed down.
+    let paced_line = |pace: &[f32]| -> Vec<(f32, f32)> {
+        let Some(&done) = pace.last() else { return Vec::new() };
+        let mut points: Vec<(f32, f32)> =
+            times.iter().filter(|&&t| t < done).map(|&t| (t / 1000.0, wpm(paced(pace, t), t))).collect();
+        if done <= seconds * 1000.0 && done > 0.0 {
+            points.push((done / 1000.0, wpm(pace.len(), done)));
+        }
+        points
+    };
+    let errors = test
+        .events
+        .iter()
+        .filter(|e| !e.correct && matches!(e.key, Key::Char(_)))
+        .map(|e| e.t as f32 / 1000.0)
+        .collect();
+
+    // Time lost per word: from the space before it (or the start) to its last letter, how
+    // long it took you minus how long the hill expected. The first keystroke is t = 0 for both.
+    let first_reach = |pos: usize| if pos == 0 { Some(0.0) } else { progress.iter().find(|r| r.1 >= pos).map(|r| r.0) };
+    let expected_at = |pos: usize| if pos == 0 { Some(0.0) } else { hill.get(pos - 1).copied() };
+    let mut lost: Option<(String, f64)> = None;
+    let mut start = 0;
+    for w in &test.words {
+        let end = start + w.len();
+        if let (Some(a), Some(b), Some(ea), Some(eb)) =
+            (first_reach(start), first_reach(end), expected_at(start), expected_at(end))
+        {
+            let loss = (b - a - (eb - ea)) as f64;
+            if loss > 0.0 && lost.as_ref().is_none_or(|l| loss > l.1) {
+                lost = Some((w.iter().collect(), loss));
+            }
+        }
+        start = end + 1;
+    }
+    Graph {
+        seconds,
+        you: line(&you_at),
+        hill: paced_line(hill),
+        ghost: ghost.map(paced_line).unwrap_or_default(),
+        errors,
+        lost,
+    }
+}
+
+fn store_flag_default_on(store: &Store, key: &str) -> bool {
+    store.setting(key).as_deref() != Some("0")
 }
 
 #[cfg(test)]
@@ -451,6 +691,125 @@ mod tests {
         assert!(Model::load_versioned(&session.store.checkpoint_path(id)).unwrap().1, "rewritten as current");
         let c = session.store.checkpoints().unwrap().into_iter().find(|c| c.id == id).unwrap();
         assert!(c.reference_wpm > 1.0, "reference speed repaired");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn typed(words: &[&str], ms: impl Fn(usize) -> f64) -> Test {
+        let mut t = Test::new(words.iter().map(|w| w.to_string()).collect());
+        let mut at = 0.0;
+        for (i, c) in words.join(" ").chars().enumerate() {
+            if i > 0 {
+                at += ms(i);
+            }
+            t.type_char(c, at);
+        }
+        t
+    }
+
+    #[test]
+    fn graph_tracks_you_against_the_pace_and_finds_the_costly_word() {
+        // 100 ms a key, except the letters of "jinx", at 400.
+        let t = typed(&["the", "jinx", "cat"], |i| if (5..=7).contains(&i) { 400.0 } else { 100.0 });
+        let pace: Vec<f32> = (0..12).map(|i| i as f32 * 100.0).collect();
+        let g = graph(&t, &pace, None, t.elapsed_ms() as f32 / 1000.0);
+        assert_eq!(g.lost.as_ref().map(|l| l.0.as_str()), Some("jinx"));
+        assert!((g.lost.unwrap().1 - 900.0).abs() < 1.0, "three letters 300 ms slower than paced");
+        let (you, hill) = (g.you.last().unwrap().1, g.hill.last().unwrap().1);
+        assert!(you < hill, "slower than the pace: {you} vs {hill}");
+        assert!(g.errors.is_empty() && g.ghost.is_empty());
+    }
+
+    #[test]
+    fn graph_counts_only_what_the_score_counts() {
+        // "hello cat" typed as "h cat": the skipped letters must not count.
+        let mut t = Test::new(vec!["hello".into(), "cat".into()]);
+        for (i, c) in "h cat".chars().enumerate() {
+            t.type_char(c, i as f64 * 250.0);
+        }
+        let g = graph(&t, &[], None, 1.0);
+        let end = g.you.last().unwrap().1 as f64;
+        assert!((end - t.score(1.0).wpm).abs() < 0.5, "graph {end} vs score {}", t.score(1.0).wpm);
+    }
+
+    #[test]
+    fn lost_time_includes_the_pause_before_a_word() {
+        // 100 ms a key, but 1100 ms before the "t" of "two".
+        let t = typed(&["one", "two", "end"], |i| if i == 4 { 1100.0 } else { 100.0 });
+        let pace: Vec<f32> = (0..11).map(|i| i as f32 * 100.0).collect();
+        let g = graph(&t, &pace, None, t.elapsed_ms() as f32 / 1000.0);
+        let (word, ms) = g.lost.expect("lost time on two");
+        assert_eq!(word, "two");
+        assert!((ms - 1000.0).abs() < 1.0, "{ms}");
+    }
+
+    #[test]
+    fn bosses_stay_on_target_even_with_common_trigrams_and_numbers() {
+        let model = Arc::new(Model::new(1));
+        let costs = Arc::new(WordCosts::new(&model));
+        let tags: Vec<String> =
+            ["_a_", "_i_", "we_", "ou_", "ing", "_th", "er_", "and"].iter().map(|t| t.to_string()).collect();
+        for seed in 0..10 {
+            let options = Options { punctuation: false, numbers: true };
+            let mut g = Generator::new(Some((model.clone(), costs.clone())), options, &[], seed).boss(&tags);
+            let used: Vec<String> = g.boss_targets().iter().map(|t| t.replace('_', " ")).collect();
+            assert!(used.len() > 4, "four rare targets get topped up");
+            for w in g.take(BOSS_WORDS as usize) {
+                let padded = format!(" {w} ");
+                assert!(used.iter().any(|t| padded.contains(t.as_str())), "{w} misses {used:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn boss_runs_are_built_from_the_target_trigrams() {
+        let model = Arc::new(Model::new(1));
+        let costs = Arc::new(WordCosts::new(&model));
+        let tags = vec!["ing".to_string(), "_th".to_string()];
+        let mut g =
+            Generator::new(Some((model, costs)), Options { punctuation: false, numbers: false }, &[], 2).boss(&tags);
+        for w in g.take(BOSS_WORDS as usize) {
+            let padded = format!(" {w} ");
+            assert!(padded.contains("ing") || padded.contains(" th"), "{w}");
+        }
+    }
+
+    #[test]
+    fn the_hill_remembers_words_from_long_ago() {
+        let dir = std::env::temp_dir().join(format!("thehill-memory-{}", std::process::id()));
+        let mut s = Session::open(&dir).unwrap();
+        let mut save = |t: &Test| {
+            let text = t.text();
+            let record = RunRecord {
+                mode: "words",
+                amount: 10,
+                punctuation: false,
+                numbers: false,
+                opponent: None,
+                text: &text,
+                wpm: 60.0,
+                raw: 60.0,
+                accuracy: 1.0,
+                predicted: 60.0,
+                hill: true,
+                boss: false,
+            };
+            s.store.save_run(&record, &t.events).unwrap();
+        };
+        // The earliest mention was never reached, so it can't shadow the run that typed it.
+        let mut unreached = Test::new(vec!["the".into(), "pueblo".into()]);
+        "the".chars().enumerate().for_each(|(i, c)| unreached.type_char(c, i as f64 * 100.0));
+        save(&unreached);
+        save(&typed(&["a", "pueblo", "cat"], |_| 250.0));
+        for _ in 0..MEMORY_RUNS_BACK {
+            save(&typed(&["the", "dog"], |_| 100.0));
+        }
+        let now = typed(&["a", "pueblo", "cat"], |_| 120.0);
+        save(&now);
+        let id = s.store.last_run_id().unwrap();
+        let m = s.memory(&now, id).unwrap().expect("remembers pueblo");
+        assert_eq!(m.word, "pueblo");
+        assert!((m.then_ms - 250.0).abs() < 1e-6 && (m.now_ms - 120.0).abs() < 1e-6);
+        assert!(s.memory(&now, id - 1).unwrap().is_none(), "nothing from inside the last 20 runs");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

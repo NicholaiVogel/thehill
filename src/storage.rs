@@ -63,6 +63,23 @@ pub struct RunRecord<'a> {
     pub predicted: f64,
     /// Played against the hill (targeted text) rather than random words.
     pub hill: bool,
+    /// A boss run: 25 words built from the hill's four worst trigrams.
+    pub boss: bool,
+}
+
+/// An earlier run a word appeared in.
+pub struct PastRun {
+    pub id: i64,
+    pub started_at: i64,
+    pub log: RunLog,
+}
+
+impl PastRun {
+    pub fn date(&self) -> String {
+        chrono::DateTime::from_timestamp(self.started_at, 0)
+            .map(|d| d.with_timezone(&chrono::Local).format("%b %-d").to_string())
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -79,6 +96,8 @@ pub struct Lifetime {
     pub wins: usize,
     pub losses: usize,
     pub longest_streak: usize,
+    pub boss_wins: usize,
+    pub boss_losses: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -162,11 +181,17 @@ impl Store {
              );
              CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
         )?;
-        // Databases from before the hill toggle.
-        let has_hill: bool =
-            conn.query_row("SELECT COUNT(*) FROM pragma_table_info('runs') WHERE name = 'hill'", [], |r| r.get(0))?;
-        if !has_hill {
-            conn.execute_batch("ALTER TABLE runs ADD COLUMN hill INTEGER NOT NULL DEFAULT 1")?;
+        // Columns added after the first release.
+        for (column, default) in [("hill", 1), ("boss", 0)] {
+            let has: bool =
+                conn.query_row("SELECT COUNT(*) FROM pragma_table_info('runs') WHERE name = ?1", [column], |r| {
+                    r.get(0)
+                })?;
+            if !has {
+                conn.execute_batch(&format!(
+                    "ALTER TABLE runs ADD COLUMN {column} INTEGER NOT NULL DEFAULT {default}"
+                ))?;
+            }
         }
         Ok(Store { conn, dir: dir.to_path_buf() })
     }
@@ -182,8 +207,8 @@ impl Store {
     pub fn save_run(&mut self, run: &RunRecord, events: &[Event]) -> Result<i64> {
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT INTO runs (started_at, mode, amount, punctuation, numbers, opponent, text, wpm, raw, accuracy, predicted, hill)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT INTO runs (started_at, mode, amount, punctuation, numbers, opponent, text, wpm, raw, accuracy, predicted, hill, boss)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 chrono::Utc::now().timestamp(),
                 run.mode,
@@ -196,7 +221,8 @@ impl Store {
                 run.raw,
                 run.accuracy,
                 run.predicted,
-                run.hill
+                run.hill,
+                run.boss
             ],
         )?;
         let id = tx.last_insert_rowid();
@@ -338,7 +364,7 @@ impl Store {
     /// Best wpm so far in this exact configuration.
     pub fn best_wpm(&self, mode: &str, amount: u32, punctuation: bool, numbers: bool) -> Result<Option<f64>> {
         Ok(self.conn.query_row(
-            "SELECT MAX(wpm) FROM runs WHERE mode = ?1 AND amount = ?2 AND punctuation = ?3 AND numbers = ?4",
+            "SELECT MAX(wpm) FROM runs WHERE mode = ?1 AND amount = ?2 AND punctuation = ?3 AND numbers = ?4 AND boss = 0",
             params![mode, amount, punctuation, numbers],
             |r| r.get(0),
         )?)
@@ -346,18 +372,18 @@ impl Store {
 
     /// (wpm, predicted) of the last `n` runs against the hill with a prediction, newest first.
     pub fn recent_results(&self, n: usize) -> Result<Vec<(f64, f64)>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT wpm, predicted FROM runs WHERE predicted > 0 AND hill = 1 ORDER BY id DESC LIMIT ?1")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT wpm, predicted FROM runs WHERE predicted > 0 AND hill = 1 AND boss = 0 ORDER BY id DESC LIMIT ?1",
+        )?;
         let rows = stmt.query_map([n as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
     pub fn lifetime(&self) -> Result<Lifetime> {
         let mut stmt =
-            self.conn.prepare("SELECT wpm, accuracy, predicted, hill, mode, amount FROM runs ORDER BY id")?;
-        let runs: Vec<(f64, f64, f64, bool, String, u32)> = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?
+            self.conn.prepare("SELECT wpm, accuracy, predicted, hill, mode, amount, boss FROM runs ORDER BY id")?;
+        let runs: Vec<(f64, f64, f64, bool, String, u32, bool)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))?
             .collect::<Result<_, _>>()?;
         let (seconds, keystrokes): (Option<f64>, i64) = self.conn.query_row(
             "SELECT (SELECT SUM(m) FROM (SELECT MAX(t) AS m FROM keys GROUP BY run_id)) / 1000.0,
@@ -373,15 +399,28 @@ impl Store {
             runs: n,
             seconds: seconds.unwrap_or(0.0),
             keystrokes,
-            best: runs.iter().max_by(|a, b| a.0.total_cmp(&b.0)).map(|r| (r.0, format!("{} {}", r.4, r.5))),
+            best: runs
+                .iter()
+                .filter(|r| !r.6)
+                .max_by(|a, b| a.0.total_cmp(&b.0))
+                .map(|r| (r.0, format!("{} {}", r.4, r.5))),
             last10: mean(&wpms[n.saturating_sub(10)..]),
             previous10: mean(&wpms[n.saturating_sub(20)..n.saturating_sub(10)]),
             accuracy10: mean(&accs),
             ..Default::default()
         };
         let mut streak = 0;
-        for (wpm, _, predicted, hill, _, _) in &runs {
+        for (wpm, _, predicted, hill, _, _, boss) in &runs {
             if !*hill || *predicted <= 0.0 {
+                continue;
+            }
+            // Bosses keep their own record and don't touch the everyday one.
+            if *boss {
+                match crate::voice::outcome(*wpm, *predicted) {
+                    std::cmp::Ordering::Greater => life.boss_wins += 1,
+                    std::cmp::Ordering::Less => life.boss_losses += 1,
+                    std::cmp::Ordering::Equal => {}
+                }
                 continue;
             }
             match crate::voice::outcome(*wpm, *predicted) {
@@ -398,6 +437,30 @@ impl Store {
             }
         }
         Ok(life)
+    }
+
+    /// The earliest run before `before_id` (exclusive) whose text contains `word` as a whole
+    /// word, ignoring case and punctuation.
+    pub fn runs_with(&self, word: &str, before_id: i64) -> Result<Vec<i64>> {
+        let mut stmt =
+            self.conn.prepare("SELECT id, text FROM runs WHERE id < ?1 AND instr(lower(text), ?2) > 0 ORDER BY id")?;
+        let rows: Vec<(i64, String)> =
+            stmt.query_map(params![before_id, word], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+        Ok(rows
+            .into_iter()
+            .filter(|(_, text)| text.split(' ').any(|w| crate::generator::bare(w) == word))
+            .map(|(id, _)| id)
+            .collect())
+    }
+
+    pub fn past_run(&self, id: i64) -> Result<PastRun> {
+        let started_at = self.conn.query_row("SELECT started_at FROM runs WHERE id = ?1", [id], |r| r.get(0))?;
+        let log = self.load_runs("SELECT id, text, wpm, hill FROM runs WHERE id = ?1", id)?.remove(0);
+        Ok(PastRun { id, started_at, log })
+    }
+
+    pub fn last_run_id(&self) -> Result<i64> {
+        Ok(self.conn.query_row("SELECT COALESCE(MAX(id), 0) FROM runs", [], |r| r.get(0))?)
     }
 
     pub fn setting(&self, key: &str) -> Option<String> {
@@ -437,6 +500,7 @@ mod tests {
             accuracy: 1.0,
             predicted: 90.0,
             hill: true,
+            boss: false,
         };
         store.save_run(&run, &events).unwrap();
         let logs = store.recent_runs(5).unwrap();

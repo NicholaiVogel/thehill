@@ -154,6 +154,21 @@ impl Test {
     /// Monkeytype's formulas. `seconds` is the run length (the time limit in time mode).
     pub fn score(&self, seconds: f64) -> Score {
         let minutes = seconds / 60.0;
+        let correct_chars = self.correct_chars();
+        let presses = self.events.iter().filter(|e| matches!(e.key, Key::Char(_)));
+        let (total, correct) = presses.fold((0, 0), |(t, c), e| (t + 1, c + usize::from(e.correct)));
+        Score {
+            wpm: correct_chars as f64 / 5.0 / minutes,
+            raw: total as f64 / 5.0 / minutes,
+            accuracy: if total == 0 { 0.0 } else { correct as f64 / total as f64 },
+            errors: total - correct,
+            seconds,
+        }
+    }
+
+    /// Chars that count toward wpm: correct words with their spaces, plus a correct prefix
+    /// of the word being typed.
+    pub fn correct_chars(&self) -> usize {
         let mut correct_chars = 0;
         for i in 0..=self.current {
             let (word, input) = (&self.words[i], &self.inputs[i]);
@@ -164,15 +179,23 @@ impl Test {
                 correct_chars += input.len();
             }
         }
-        let presses = self.events.iter().filter(|e| matches!(e.key, Key::Char(_)));
-        let (total, correct) = presses.fold((0, 0), |(t, c), e| (t + 1, c + usize::from(e.correct)));
-        Score {
-            wpm: correct_chars as f64 / 5.0 / minutes,
-            raw: total as f64 / 5.0 / minutes,
-            accuracy: if total == 0 { 0.0 } else { correct as f64 / total as f64 },
-            errors: total - correct,
-            seconds,
-        }
+        correct_chars
+    }
+
+    /// Replays the event log on fresh text, giving the counted chars after each event.
+    pub fn progress(&self) -> Vec<(f64, usize)> {
+        let mut replay = Test::new(self.words.iter().map(|w| w.iter().collect()).collect());
+        self.events
+            .iter()
+            .map(|e| {
+                match e.key {
+                    Key::Char(c) => replay.type_char(c, e.t),
+                    Key::Backspace => replay.backspace(e.t),
+                    Key::ClearWord => replay.clear_word(e.t),
+                }
+                (e.t, replay.correct_chars())
+            })
+            .collect()
     }
 
     /// Duration from the first to the last keypress, for words mode.

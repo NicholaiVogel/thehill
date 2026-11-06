@@ -19,6 +19,11 @@ const EXPLORE_SHARE: f64 = 0.2;
 const VARIANTS: usize = 3;
 /// Distinct words from recent runs that rest, families included.
 pub const REST_WORDS: usize = 150;
+/// Boss runs: extra score, in ms per keystroke, for each of the target trigrams a word holds.
+const BOSS_HIT_MS: f32 = 40.0;
+/// Boss runs take targets, worst first, until this many words hold one, so family and rest
+/// rules never run them dry.
+const BOSS_MIN_WORDS: usize = 150;
 
 pub fn words() -> &'static [&'static str] {
     static WORDS: OnceLock<Vec<&'static str>> = OnceLock::new();
@@ -147,9 +152,46 @@ pub struct Generator {
     emitted: VecDeque<String>,
     prev: String,
     capitalize: bool,
+    /// Boss runs draw only from words holding the target trigrams, with a bonus per hit.
+    boss: Option<(Vec<usize>, Vec<f32>)>,
+    boss_targets: Vec<String>,
 }
 
 impl Generator {
+    /// Turns this into a boss generator aimed at `tags` (trigrams, `_` for a space). Words
+    /// holding none of them are out; the more a word holds, the likelier it is. No exploring.
+    /// `tags` come worst first; at least four are used, more while too few words hold one.
+    pub fn boss(mut self, tags: &[String]) -> Self {
+        let hits = |trigrams: &[String], w: &str| -> usize {
+            let padded = format!(" {w} ");
+            trigrams.iter().map(|t| padded.matches(t.replace('_', " ").as_str()).count()).sum()
+        };
+        let eligible = |trigrams: &[String]| {
+            words().iter().enumerate().filter(|(_, w)| w.len() >= 3 && hits(trigrams, w) > 0).map(|(i, _)| i).collect()
+        };
+        let mut used = tags.len().min(4);
+        let mut candidates: Vec<usize> = eligible(&tags[..used]);
+        while candidates.len() < BOSS_MIN_WORDS && used < tags.len() {
+            used += 1;
+            candidates = eligible(&tags[..used]);
+        }
+        if candidates.is_empty() {
+            return self;
+        }
+        let bonus = candidates
+            .iter()
+            .map(|&i| BOSS_HIT_MS * hits(&tags[..used], words()[i]) as f32 / (words()[i].len() + 1) as f32)
+            .collect();
+        self.boss = Some((candidates, bonus));
+        self.boss_targets = tags[..used].to_vec();
+        self
+    }
+
+    /// The trigrams a boss run is built from; empty for an ordinary run.
+    pub fn boss_targets(&self) -> &[String] {
+        &self.boss_targets
+    }
+
     /// `opponent` is `None` during cold start or with the hill off: words are then drawn
     /// uniformly from the most common, like any typing test. `rest` is recent words to avoid.
     pub fn new(opponent: Option<(Arc<Model>, Arc<WordCosts>)>, options: Options, rest: &[String], seed: u64) -> Self {
@@ -165,6 +207,8 @@ impl Generator {
             emitted: VecDeque::new(),
             prev: String::new(),
             capitalize: options.punctuation,
+            boss: None,
+            boss_targets: Vec::new(),
         }
     }
 
@@ -197,7 +241,7 @@ impl Generator {
                 }
             };
         };
-        if self.rng.random_bool(EXPLORE_SHARE) {
+        if self.boss.is_none() && self.rng.random_bool(EXPLORE_SHARE) {
             // Explore by uncertainty alone, so known weaknesses can't crowd it out.
             let all: Vec<usize> = (0..words().len()).collect();
             let scores: Vec<f64> = costs.bonus.iter().map(|&b| b as f64).collect();
@@ -205,17 +249,19 @@ impl Generator {
         }
         // Targeted: rescore the shortlist with the real transition out of the previous word.
         let prev_tail: String = self.prev.chars().rev().take(2).collect::<Vec<_>>().into_iter().rev().collect();
-        let scores: Vec<f64> = costs
-            .shortlist
-            .iter()
-            .map(|&i| {
-                let w = words()[i];
-                let text = in_context(&prev_tail, w);
-                let first = model.cost(&Feat::at(&text, prev_tail.len() + 1)) - costs.first_base;
-                ((first + costs.rest[i]) / (w.len() + 1) as f32) as f64
-            })
-            .collect();
-        self.sample(&costs.shortlist, &scores)
+        let score = |i: usize| {
+            let w = words()[i];
+            let text = in_context(&prev_tail, w);
+            let first = model.cost(&Feat::at(&text, prev_tail.len() + 1)) - costs.first_base;
+            (first + costs.rest[i]) / (w.len() + 1) as f32
+        };
+        let (candidates, scores): (Vec<usize>, Vec<f64>) = match &self.boss {
+            Some((candidates, bonus)) => {
+                (candidates.clone(), candidates.iter().zip(bonus).map(|(&i, b)| (score(i) + b) as f64).collect())
+            }
+            None => (costs.shortlist.clone(), costs.shortlist.iter().map(|&i| score(i) as f64).collect()),
+        };
+        self.sample(&candidates, &scores)
     }
 
     /// Samples ∝ exp(z / T) over z-scored `scores`, skipping families used in this run and,
@@ -231,6 +277,10 @@ impl Generator {
         let mut allowed = fresh(true);
         if !allowed.contains(&true) {
             allowed = fresh(false);
+        }
+        if !allowed.contains(&true) && self.boss.is_some() {
+            // A boss never leaves its targets: a repeated family beats an off-target word.
+            allowed = vec![true; candidates.len()];
         }
         if !allowed.contains(&true) {
             // Every candidate's family is used: any unused family from the whole list beats a repeat.
@@ -288,7 +338,8 @@ impl Generator {
     /// One random decoration of `word`, and whether the next word starts a sentence.
     fn variant(&mut self, word: &str) -> (String, bool) {
         let rng = &mut self.rng;
-        if self.options.numbers && rng.random_bool(0.1) {
+        // Numbers would replace a boss's targeted words, so bosses don't get them.
+        if self.options.numbers && self.boss.is_none() && rng.random_bool(0.1) {
             let digits = rng.random_range(1..=4);
             let n = rng.random_range(10u32.pow(digits - 1)..10u32.pow(digits));
             return (n.to_string(), self.capitalize);
@@ -324,13 +375,15 @@ impl Generator {
     }
 }
 
+/// A typed word without decorations: lowercase, no surrounding punctuation or "'s".
+pub fn bare(word: &str) -> String {
+    word.trim_matches(|c: char| !c.is_ascii_alphabetic()).trim_end_matches("'s").to_ascii_lowercase()
+}
+
 /// Vocabulary words in the part of a run the user reached, decorations stripped.
 pub fn typed_words(text: &[char], reached: usize) -> Vec<String> {
     let s: String = text[..reached.min(text.len())].iter().collect();
-    s.split(' ')
-        .map(|w| w.trim_matches(|c: char| !c.is_ascii_alphabetic()).trim_end_matches("'s").to_ascii_lowercase())
-        .filter(|w| index_of(w).is_some())
-        .collect()
+    s.split(' ').map(bare).filter(|w| index_of(w).is_some()).collect()
 }
 
 #[cfg(test)]

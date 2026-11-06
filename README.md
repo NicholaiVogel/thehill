@@ -31,7 +31,11 @@ The text font is JetBrains Mono if it's installed, then DejaVu Sans Mono or Menl
 
 - Modes: `words 10 / 50`, `time 10 / 15 / 30`. Toggles for punctuation and numbers. Click them in the top bar.
 - The run starts on your first keystroke. `tab` gives new text, `esc` restarts the same text, `ctrl+backspace` (or `alt+backspace`) clears the word.
-- The results screen shows wpm, accuracy, raw, what the model predicted for exactly that text, and your slowest transitions.
+- The prediction is committed before you type and shown above the text; the run is judged against exactly that number (within 3% is a draw).
+- The results screen graphs your wpm through the run against the hill's committed pace (dashed) and the ghost, marks your mistakes, and names the word you lost the most time on.
+- Boss runs: every 10th run against the live hill is 25 words built from its worst trigrams (four, or more if too few words hold them). It guards the checkpoint that follows; new text or a retry doesn't skip it. Bosses keep their own record.
+- Ghost (`ctrl+g`): a faint second caret typing the same text at the pace of the checkpoint frozen about 50 runs ago, i.e. you back then. Its score shows as "past you".
+- The hill sometimes brings up a word from this run that you also typed at least 20 runs ago, when your time per letter on it has changed by 15% or more.
 - `ctrl+s` (or `s` on the results screen) opens the slope: every checkpoint, plotted by how fast it thinks you type. Pick one with the arrow keys and `enter` to play against it. Its text targets the weaknesses you had back then, and the results show how far past its prediction you've moved.
 
 ## How the model works

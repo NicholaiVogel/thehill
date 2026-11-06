@@ -188,6 +188,7 @@ struct TheHill {
     focus: FocusHandle,
     started: Option<Instant>,
     caret: Caret,
+    ghost_caret: Caret,
     font: SharedString,
     zoom: f32,
     training: bool,
@@ -232,6 +233,7 @@ pub fn run(session: Session) {
                     focus,
                     started: None,
                     caret: Caret::new(Instant::now()),
+                    ghost_caret: Caret::new(Instant::now()),
                     font: family.into(),
                     zoom,
                     training: false,
@@ -323,6 +325,7 @@ impl TheHill {
 
     fn reset(&mut self, cx: &mut Context<Self>) {
         self.started = None;
+        self.ghost_caret = Caret::new(Instant::now());
         self.heckles = 0;
         self.last_heckle = None;
         self.screen = Screen::Typing;
@@ -520,6 +523,7 @@ impl TheHill {
                 "s" => return self.open_stats(cx),
                 "h" if !self.running() => return self.change_settings(cx, |s| s.hill ^= true),
                 "t" => return self.toggle_theme(cx),
+                "g" if !self.running() => return self.change_settings(cx, |s| s.ghost ^= true),
                 "=" | "+" => return self.set_zoom(self.zoom + ZOOM_STEP, cx),
                 "-" => return self.set_zoom(self.zoom - ZOOM_STEP, cx),
                 "0" => return self.set_zoom(1.0, cx),
@@ -617,13 +621,20 @@ impl TheHill {
         };
         div()
             .flex()
+            .flex_wrap()
+            .justify_center()
             .items_center()
             .gap(self.z(16.0))
+            .px(self.z(24.0))
             .text_size(self.z(UI_SIZE))
             .opacity(if self.running() { 0.0 } else { 1.0 })
             .child(
                 item("hill", "the hill".into(), self.session.hill)
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.change_settings(cx, |s| s.hill ^= true))),
+            )
+            .child(
+                item("ghost", "ghost".into(), self.session.ghost)
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.change_settings(cx, |s| s.ghost ^= true))),
             )
             .child(divider())
             .child(item("punctuation", "punctuation".into(), options.punctuation).on_click(
@@ -679,6 +690,17 @@ impl TheHill {
         let current_line = lines.iter().position(|l| l.contains(&test.current)).unwrap_or(0);
         let top = current_line.saturating_sub(1);
 
+        // Where the ghost is: chars typed at its pace so far, as (word, offset in word).
+        let ghost_at = self.run.ghost.as_ref().filter(|_| self.started.is_some()).map(|g| {
+            let typed = g.pace.partition_point(|&p| p as f64 <= self.elapsed_ms());
+            let (mut word, mut start) = (0, 0);
+            while word + 1 < test.words.len() && start + test.words[word].len() < typed {
+                start += test.words[word].len() + 1;
+                word += 1;
+            }
+            (word, (typed - start).min(test.words[word].len()))
+        });
+        let mut ghost = None;
         let mut rows = Vec::new();
         let mut caret = Point::default();
         for (row, range) in lines.iter().enumerate().skip(top).take(3) {
@@ -690,6 +712,9 @@ impl TheHill {
                 }
                 if i == test.current {
                     caret = point(px((col + test.inputs[i].len()) as f32 * char_w), px((row - top) as f32 * line_h));
+                }
+                if let Some((_, k)) = ghost_at.filter(|(g, _)| *g == i) {
+                    ghost = Some(point(px((col + k) as f32 * char_w), px((row - top) as f32 * line_h)));
                 }
                 let (word, input) = (&test.words[i], &test.inputs[i]);
                 for k in 0..shown(i) {
@@ -721,6 +746,14 @@ impl TheHill {
         if moving {
             window.request_animation_frame();
         }
+        let ghost = ghost.map(|g| {
+            if g != self.ghost_caret.to {
+                self.ghost_caret.retarget(g, now);
+            }
+            // The ghost moves on its own clock, so keep frames coming while it's on screen.
+            window.request_animation_frame();
+            self.ghost_caret.step(now).0
+        });
         let blink_off = self.started.is_none() && now.duration_since(self.caret.since).as_millis() % 1000 >= 500;
         let caret_h = TEXT_SIZE * 1.2 * self.zoom;
 
@@ -744,6 +777,18 @@ impl TheHill {
                     .bg(color(pal().accent))
                     .opacity(if blink_off { 0.0 } else { 1.0 }),
             )
+            .when_some(ghost, |d, g| {
+                d.child(
+                    div()
+                        .absolute()
+                        .left(g.x - px(1.0))
+                        .top(g.y + px((line_h - caret_h) / 2.0))
+                        .w(self.z(2.0))
+                        .h(px(caret_h))
+                        .rounded(px(1.0))
+                        .bg(color(pal().untyped)),
+                )
+            })
     }
 
     /// The hill's line under the typing area. The slot keeps its height so nothing jumps.
@@ -771,6 +816,7 @@ impl TheHill {
         if self.started.is_none() {
             // Committed before you type, so the hill can't move the line afterwards.
             return match self.run.predicted {
+                p if p > 0.0 && self.run.boss => format!("boss  ·  predicts {p:.0}"),
                 p if p > 0.0 => format!("predicts {p:.0}"),
                 _ => String::new(),
             };
@@ -800,7 +846,7 @@ impl TheHill {
             )
     }
 
-    fn render_results(&self, done: &Finished, shown: &[Instant], window: &mut Window) -> impl IntoElement {
+    fn render_results(&self, done: &Finished, shown: &[Instant], width: f32, window: &mut Window) -> impl IntoElement {
         let s = &done.score;
         let mode = match done.mode {
             Mode::Words(n) => format!("words {n}"),
@@ -842,31 +888,42 @@ impl TheHill {
         if !slowest.is_empty() {
             insights = insights.child(row("slowest", slowest, pal().correct));
         }
+        if let Some((word, ms)) = &done.graph.lost {
+            insights = insights.child(row("lost most on", vec![format!("{word} +{ms:.0}ms")], pal().correct));
+        }
 
+        let headline = div()
+            .flex()
+            .gap(self.z(48.0))
+            .child(self.stat("wpm", format!("{:.0}", s.wpm), true))
+            .child(self.stat("acc", format!("{:.0}%", s.accuracy * 100.0), true));
+        let headline_w = 300.0 * self.zoom;
+        let mut numbers =
+            div().flex().gap(self.z(40.0)).child(self.stat("raw", format!("{:.0}", s.raw), false)).child(self.stat(
+                "predicted",
+                if done.predicted > 0.0 { format!("{:.0}", done.predicted) } else { "-".into() },
+                false,
+            ));
+        if let Some((_, wpm)) = &done.ghost {
+            numbers = numbers.child(self.stat("past you", format!("{wpm:.0}"), false));
+        }
         div()
             .flex()
             .flex_col()
             .gap(self.z(24.0))
             .child(
-                div().flex().gap(self.z(48.0)).child(self.stat("wpm", format!("{:.0}", s.wpm), true)).child(self.stat(
-                    "acc",
-                    format!("{:.0}%", s.accuracy * 100.0),
-                    true,
-                )),
-            )
-            .child(
                 div()
                     .flex()
-                    .gap(self.z(40.0))
-                    .child(self.stat("raw", format!("{:.0}", s.raw), false))
-                    .child(self.stat(
-                        "predicted",
-                        if done.predicted > 0.0 { format!("{:.0}", done.predicted) } else { "-".into() },
-                        false,
-                    ))
-                    .child(self.stat("errors", s.errors.to_string(), false))
-                    .child(self.stat("mode", mode, false)),
+                    .items_start()
+                    .gap(self.z(24.0))
+                    .child(div().w(px(headline_w)).flex_none().child(headline))
+                    .child(self.render_run_graph(done, (width - headline_w - 24.0 * self.zoom).max(200.0))),
             )
+            .child(numbers.child(self.stat("errors", s.errors.to_string(), false)).child(self.stat(
+                "mode",
+                if done.boss { "boss".into() } else { mode },
+                false,
+            )))
             .child(
                 div()
                     .flex()
@@ -921,14 +978,15 @@ impl TheHill {
             ("accuracy", or_dash(life.accuracy10.map(|a| format!("{:.1}%", a * 100.0)))),
             ("vs the hill", format!("{}-{}", life.wins, life.losses)),
             ("best streak", life.longest_streak.to_string()),
+            ("bosses", format!("{}-{}", life.boss_wins, life.boss_losses)),
         ];
-        // Two rows of four equal columns.
+        // Three rows of three equal columns.
         let row = |cells: &[(&str, String)]| {
             div().flex().children(
                 cells.iter().map(|(label, value)| div().flex_1().child(self.stat(label, value.clone(), false))),
             )
         };
-        div().flex().flex_col().gap(self.z(16.0)).w_full().child(row(&stats[..4])).child(row(&stats[4..]))
+        div().flex().flex_col().gap(self.z(16.0)).w_full().children(stats.chunks(3).map(row))
     }
 
     fn render_chart(&self, st: &Stats, width: f32, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1044,6 +1102,106 @@ impl TheHill {
             .into_any_element()
     }
 
+    /// Cumulative wpm through the run: you (solid), the hill's committed pace (dashed), the
+    /// ghost (dim), with your mistakes marked along the bottom.
+    fn render_run_graph(&self, done: &Finished, width: f32) -> impl IntoElement {
+        let g = &done.graph;
+        let height = 150.0 * self.zoom;
+        let (left, bottom, top) = (32.0 * self.zoom, 20.0 * self.zoom, 8.0 * self.zoom);
+        let all = g.you.iter().chain(&g.hill).chain(&g.ghost).map(|p| p.1);
+        let (lo, hi) = all.fold((f32::MAX, f32::MIN), |(lo, hi), v| (lo.min(v), hi.max(v)));
+        if g.you.is_empty() || !lo.is_finite() {
+            return div().into_any_element();
+        }
+        let pad = ((hi - lo) * 0.1).max(5.0);
+        let (lo, hi) = ((lo - pad).max(0.0), hi + pad);
+        let to_xy = move |(t, v): (f32, f32)| {
+            point(
+                px(left + t / g.seconds.max(0.1) * (width - left)),
+                px(top + (1.0 - (v - lo) / (hi - lo)) * (height - top - bottom)),
+            )
+        };
+        let pts = |line: &[(f32, f32)]| line.iter().map(|&p| to_xy(p)).collect::<Vec<_>>();
+        let (you, hill, ghost) = (pts(&g.you), pts(&g.hill), pts(&g.ghost));
+        let (stroke, thin) = (px(2.0 * self.zoom), px(1.5 * self.zoom));
+        let dash = (6.0 * self.zoom, 4.0 * self.zoom);
+        let (you_c, hill_c, ghost_c) = (pal().accent, pal().untyped, mix(pal().bg, pal().untyped, 0.55));
+        let small = self.z(11.0);
+        let label = |text: String, x: f32, y: f32| {
+            div().absolute().left(px(x)).top(px(y)).text_size(small).text_color(color(pal().untyped)).child(text)
+        };
+        let dot = 4.0 * self.zoom;
+        let errors = g.errors.iter().map(|&t| {
+            let x = f32::from(to_xy((t, lo)).x);
+            div()
+                .absolute()
+                .left(px(x - dot / 2.0))
+                .top(px(height - bottom - dot / 2.0))
+                .size(px(dot))
+                .rounded_full()
+                .bg(color(pal().error))
+        });
+        let key = |name: String, c: Hsla, dashed: bool| {
+            div()
+                .flex()
+                .items_center()
+                .gap(self.z(6.0))
+                .child(div().w(self.z(14.0)).h(self.z(2.0)).bg(c).opacity(if dashed { 0.7 } else { 1.0 }))
+                .child(name)
+        };
+        let mut legend = div().flex().gap(self.z(16.0)).text_size(small).text_color(color(pal().untyped)).child(key(
+            "you".into(),
+            color(you_c),
+            false,
+        ));
+        if !hill.is_empty() {
+            legend = legend.child(key("the hill".into(), color(hill_c), true));
+        }
+        if let Some((label, _)) = &done.ghost {
+            legend = legend.child(key(format!("past you, {label}"), ghost_c, false));
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap(self.z(6.0))
+            .child(
+                div()
+                    .relative()
+                    .w(px(width))
+                    .h(px(height))
+                    .child(
+                        canvas(
+                            |_, _, _| {},
+                            move |bounds, _, window, _| {
+                                let shift =
+                                    |ps: &[Point<Pixels>]| ps.iter().map(|&p| bounds.origin + p).collect::<Vec<_>>();
+                                if let Some(p) = polyline(&shift(&ghost), thin, None) {
+                                    window.paint_path(p, ghost_c);
+                                }
+                                if let Some(p) = polyline(&shift(&hill), thin, Some(dash)) {
+                                    window.paint_path(p, rgb(hill_c));
+                                }
+                                if let Some(p) = polyline(&shift(&you), stroke, None) {
+                                    window.paint_path(p, rgb(you_c));
+                                }
+                            },
+                        )
+                        .size_full(),
+                    )
+                    .child(label(format!("{hi:.0}"), 0.0, top - 7.0 * self.zoom))
+                    .child(label(format!("{lo:.0}"), 0.0, height - bottom - 7.0 * self.zoom))
+                    .child(label("0s".into(), left, height - bottom + 4.0 * self.zoom))
+                    .child(label(
+                        format!("{:.0}s", g.seconds),
+                        width - 24.0 * self.zoom,
+                        height - bottom + 4.0 * self.zoom,
+                    ))
+                    .children(errors),
+            )
+            .child(legend)
+            .into_any_element()
+    }
+
     fn render_selected(&self, st: &Stats) -> impl IntoElement {
         let line = |text: String, hex: u32| div().text_color(color(hex)).child(text);
         let mut panel = div().flex().flex_col().gap(self.z(8.0)).text_size(self.z(UI_SIZE)).max_w(self.z(420.0));
@@ -1126,6 +1284,43 @@ impl TheHill {
     }
 }
 
+/// A stroked polyline; with `dash`, drawn as (on, off) dashes along its length.
+fn polyline(points: &[Point<Pixels>], width: Pixels, dash: Option<(f32, f32)>) -> Option<gpui::Path<Pixels>> {
+    let mut path = PathBuilder::stroke(width);
+    let &first = points.first()?;
+    match dash {
+        None => {
+            path.move_to(first);
+            points[1..].iter().for_each(|&p| path.line_to(p));
+        }
+        Some((on, off)) => {
+            // Walk the line, alternating pen down and pen up, carrying the phase across corners.
+            let (mut phase, mut down) = (on, true);
+            for pair in points.windows(2) {
+                let (a, b) = (pair[0], pair[1]);
+                let (dx, dy) = (f32::from(b.x - a.x), f32::from(b.y - a.y));
+                let len = (dx * dx + dy * dy).sqrt();
+                let mut walked = 0.0;
+                while walked < len {
+                    let step = phase.min(len - walked);
+                    let at = |d: f32| point(a.x + px(dx * d / len), a.y + px(dy * d / len));
+                    if down {
+                        path.move_to(at(walked));
+                        path.line_to(at(walked + step));
+                    }
+                    walked += step;
+                    phase -= step;
+                    if phase <= 0.0 {
+                        down = !down;
+                        phase = if down { on } else { off };
+                    }
+                }
+            }
+        }
+    }
+    path.build().ok()
+}
+
 fn mix(a: u32, b: u32, t: f32) -> Hsla {
     let ch = |c: u32, shift: u32| ((c >> shift) & 0xff) as f32;
     let lerp = |shift| ch(a, shift) + (ch(b, shift) - ch(a, shift)) * t.clamp(0.0, 1.0);
@@ -1166,12 +1361,12 @@ impl Render for TheHill {
                 .child(self.render_typing(width, char_w, window))
                 .child(self.render_speech(window))
                 .into_any_element(),
-            Screen::Results { done, shown } => self.render_results(done, shown, window).into_any_element(),
+            Screen::Results { done, shown } => self.render_results(done, shown, width, window).into_any_element(),
             Screen::Stats(_) => self.render_stats(width, cx).into_any_element(),
         };
         let hint = match self.screen {
             Screen::Typing => {
-                "tab new text  ·  esc restart  ·  ctrl+s stats  ·  ctrl+h hill  ·  ctrl+t theme  ·  ctrl +/- zoom"
+                "tab new text  ·  esc restart  ·  ctrl+s stats  ·  ctrl+h hill  ·  ctrl+g ghost  ·  ctrl+t theme  ·  ctrl +/- zoom"
             }
             Screen::Results { .. } => "enter new text  ·  esc retry  ·  s stats",
             Screen::Stats(_) => "",
