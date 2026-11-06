@@ -1,4 +1,4 @@
-# Sisyphus
+# The Hill
 
 A typing trainer in the spirit of monkeytype, with one difficulty: a small neural network that learns which keystrokes slow you down and feeds you text built from them. Fix a weakness and it moves on to the next one.
 
@@ -21,8 +21,8 @@ To install on Linux with a launcher entry:
 
 ```sh
 cargo install --path . --locked
-sed "s|/home/nicholai|$HOME|" assets/sisyphus.desktop > ~/.local/share/applications/sisyphus.desktop
-install -Dm644 assets/icon.svg ~/.local/share/icons/hicolor/scalable/apps/sisyphus.svg
+sed "s|/home/nicholai|$HOME|" assets/thehill.desktop > ~/.local/share/applications/thehill.desktop
+install -Dm644 assets/icon.svg ~/.local/share/icons/hicolor/scalable/apps/thehill.svg
 ```
 
 The text font is JetBrains Mono if it's installed, then DejaVu Sans Mono or Menlo.
@@ -36,9 +36,9 @@ The text font is JetBrains Mono if it's installed, then DejaVu Sans Mono or Menl
 
 ## How the model works
 
-Every keypress is logged to SQLite with its timestamp, the text position it aimed at, and whether it was right. That log is the source of truth. The model is derived from it and can be rebuilt any time with `sisyphus --retrain`.
+Every keypress is logged to SQLite with its timestamp, the text position it aimed at, and whether it was right. That log is the source of truth. The model is derived from it and can be rebuilt any time with `thehill --retrain`.
 
-The network sees one keystroke at a time: the two chars before it, the char itself (as learned 16-d embeddings), whether it needs shift, and where it sits in its word. Two dense layers of 64 units feed two heads: the log interval in ms, and the probability that you get it wrong. A keystroke's cost is `scale × interval + p(error) × E`. After each training pass, `scale` (mean over typical interval) and `E` (what an error costs you in scored time) are fitted so that predicted wpm matches the wpm you actually scored over recent runs; `sisyphus --calibrate` shows the fit run by run. The embeddings are shared across all contexts, so a slow `ght` makes the model expect `ghts` and `ought` to be slow too before you've typed them.
+The network sees one keystroke at a time: the two chars before it, the char itself (as learned 16-d embeddings), whether it needs shift, and where it sits in its word. Two dense layers of 64 units feed two heads: the log interval in ms, and the probability that you get it wrong. A keystroke's cost is `scale × interval + p(error) × E`. After each training pass, `scale` (mean over typical interval) and `E` (what an error costs you in scored time) are fitted so that predicted wpm matches the wpm you actually scored over recent runs; `thehill --calibrate` shows the fit run by run. The embeddings are shared across all contexts, so a slow `ght` makes the model expect `ghts` and `ought` to be slow too before you've typed them.
 
 After every run it trains for a few epochs on the last 300 runs on a background thread. Recent runs weigh more (half-life of 40 runs), so weaknesses you've fixed fade out.
 
@@ -55,18 +55,18 @@ The first 3 runs use plain common words while the model gets its first data.
 
 ## Data
 
-`~/.local/share/sisyphus` on Linux, `~/Library/Application Support/sisyphus` on macOS. Override with `SISYPHUS_DATA_DIR`.
+`~/.local/share/thehill` on Linux, `~/Library/Application Support/thehill` on macOS. Data from the earlier name (Sisyphus) is copied over on first launch. Override with `THEHILL_DATA_DIR`.
 
-- `sisyphus.db`: runs, keystrokes, checkpoints, settings
+- `thehill.db`: runs, keystrokes, checkpoints, settings
 - `live.bin`: current model
 - `checkpoints/<id>.bin`: frozen models
 
 ## CLI
 
 ```sh
-sisyphus --stats                         # runs, checkpoints, weakest transitions, hardest words
-sisyphus --retrain                       # rebuild the live model from the whole log
-sisyphus --simulate 60 --slow th,er      # synthetic typist, headless; uses a temp dir unless SISYPHUS_DATA_DIR is set
+thehill --stats                         # runs, checkpoints, weakest transitions, hardest words
+thehill --retrain                       # rebuild the live model from the whole log
+thehill --simulate 60 --slow th,er      # synthetic typist, headless; uses a temp dir unless THEHILL_DATA_DIR is set
 ```
 
 ## Word list

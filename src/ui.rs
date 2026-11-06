@@ -181,7 +181,7 @@ fn revealed(since: Instant, now: Instant) -> usize {
     (now.duration_since(since).as_secs_f32() * 1000.0 / MS_PER_CHAR) as usize
 }
 
-struct Sisyphus {
+struct TheHill {
     session: Session,
     run: Run,
     screen: Screen,
@@ -206,11 +206,11 @@ pub fn run(session: Session) {
         let bounds = Bounds::centered(None, size(px(1100.0), px(700.0)), cx);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
-            app_id: Some("sisyphus".into()),
+            app_id: Some("thehill".into()),
             // On macOS the content runs under a transparent titlebar, traffic lights inside the
             // window. Linux keeps the compositor's decorations.
             titlebar: Some(gpui::TitlebarOptions {
-                title: Some("Sisyphus".into()),
+                title: Some("The Hill".into()),
                 appears_transparent: cfg!(target_os = "macos"),
                 traffic_light_position: cfg!(target_os = "macos").then(|| point(px(14.0), px(14.0))),
             }),
@@ -225,7 +225,7 @@ pub fn run(session: Session) {
                 LIGHT_MODE.store(session.store.setting("theme").as_deref() == Some("light"), Ordering::Relaxed);
                 let run = session.new_run().expect("could not start a run");
                 let speech = Some(Speech::new(run.preview.clone()));
-                let app = Sisyphus {
+                let app = TheHill {
                     session,
                     run,
                     screen: Screen::Typing,
@@ -244,7 +244,7 @@ pub fn run(session: Session) {
                 cx.spawn(async move |this, cx| {
                     loop {
                         cx.background_executor().timer(Duration::from_millis(50)).await;
-                        if this.update(cx, |this: &mut Sisyphus, cx| this.tick(cx)).is_err() {
+                        if this.update(cx, |this: &mut TheHill, cx| this.tick(cx)).is_err() {
                             break;
                         }
                     }
@@ -258,7 +258,7 @@ pub fn run(session: Session) {
     });
 }
 
-impl Sisyphus {
+impl TheHill {
     /// A design size in pixels at the current zoom.
     fn z(&self, v: f32) -> Pixels {
         px(v * self.zoom)
@@ -307,7 +307,7 @@ impl Sisyphus {
     fn new_run(&mut self, cx: &mut Context<Self>) {
         match self.session.new_run() {
             Ok(run) => self.run = run,
-            Err(e) => eprintln!("sisyphus: could not generate a run: {e:#}"),
+            Err(e) => eprintln!("thehill: could not generate a run: {e:#}"),
         }
         let line = self.pending.take().unwrap_or_else(|| self.run.preview.clone());
         self.speech = Some(Speech::new(line));
@@ -338,7 +338,7 @@ impl Sisyphus {
                 self.screen = Screen::Results { done, shown };
             }
             Err(e) => {
-                eprintln!("sisyphus: could not save the run: {e:#}");
+                eprintln!("thehill: could not save the run: {e:#}");
                 return self.new_run(cx);
             }
         }
@@ -367,7 +367,7 @@ impl Sisyphus {
                             this.announce(line);
                         }
                     }
-                    Err(e) => eprintln!("sisyphus: training failed: {e:#}"),
+                    Err(e) => eprintln!("thehill: training failed: {e:#}"),
                 }
                 this.training = false;
                 if std::mem::take(&mut this.train_again) {
@@ -478,7 +478,7 @@ impl Sisyphus {
 
     fn choose_opponent(&mut self, id: Option<i64>, cx: &mut Context<Self>) {
         if let Err(e) = self.session.set_opponent(id).and_then(|_| self.session.save_settings()) {
-            eprintln!("sisyphus: could not switch opponent: {e:#}");
+            eprintln!("thehill: could not switch opponent: {e:#}");
         }
         self.new_run(cx);
     }
@@ -490,7 +490,7 @@ impl Sisyphus {
         }
         change(&mut self.session);
         if let Err(e) = self.session.save_settings() {
-            eprintln!("sisyphus: could not save settings: {e:#}");
+            eprintln!("thehill: could not save settings: {e:#}");
         }
         self.new_run(cx);
     }
@@ -499,7 +499,7 @@ impl Sisyphus {
         let light = !LIGHT_MODE.load(Ordering::Relaxed);
         LIGHT_MODE.store(light, Ordering::Relaxed);
         if let Err(e) = self.session.store.set_setting("theme", if light { "light" } else { "dark" }) {
-            eprintln!("sisyphus: could not save theme: {e:#}");
+            eprintln!("thehill: could not save theme: {e:#}");
         }
         cx.notify();
     }
@@ -507,7 +507,7 @@ impl Sisyphus {
     fn set_zoom(&mut self, zoom: f32, cx: &mut Context<Self>) {
         self.zoom = normalize_zoom(zoom);
         if let Err(e) = self.session.store.set_setting("zoom", &format!("{:.1}", self.zoom)) {
-            eprintln!("sisyphus: could not save zoom: {e:#}");
+            eprintln!("thehill: could not save zoom: {e:#}");
         }
         cx.notify();
     }
@@ -1145,7 +1145,7 @@ fn thousands(n: i64) -> String {
     if n >= 10_000 { format!("{:.1}k", n as f64 / 1000.0) } else { n.to_string() }
 }
 
-impl Render for Sisyphus {
+impl Render for TheHill {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let viewport = window.viewport_size();
         let width = (f32::from(viewport.width) - 96.0).min(MAX_WIDTH * self.zoom);
@@ -1161,11 +1161,7 @@ impl Render for Sisyphus {
                 .flex_col()
                 .gap(self.z(8.0))
                 .child(
-                    div()
-                        .h(self.z(32.0))
-                        .text_size(self.z(24.0))
-                        .text_color(color(if self.started.is_some() { pal().accent } else { pal().untyped }))
-                        .child(self.counter()),
+                    div().h(self.z(32.0)).text_size(self.z(24.0)).text_color(color(pal().accent)).child(self.counter()),
                 )
                 .child(self.render_typing(width, char_w, window))
                 .child(self.render_speech(window))

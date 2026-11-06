@@ -386,7 +386,7 @@ impl Model {
         let current = bytes.starts_with(MAGIC) && bytes.len() == 5 + 8 + body;
         let old = bytes.starts_with(b"SSPH\x01") && bytes.len() == 5 + 4 + body;
         if !current && !old && !v2 {
-            return Err(std::io::Error::other(format!("{} is not a sisyphus model", path.display())));
+            return Err(std::io::Error::other(format!("{} is not a model file", path.display())));
         }
         let f32_at = |i: usize| f32::from_le_bytes(bytes[i..i + 4].try_into().unwrap());
         let words = |b: &[u8]| -> Vec<[u8; 4]> { b.chunks_exact(4).map(|c| c.try_into().unwrap()).collect() };
@@ -543,7 +543,7 @@ mod tests {
 
     #[test]
     fn save_and_load_give_identical_predictions() {
-        let dir = std::env::temp_dir().join(format!("sisyphus-model-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("thehill-model-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut model = Model::new(9);
         model.error_ms = 432.0;
@@ -632,7 +632,7 @@ mod tests {
 
     #[test]
     fn old_model_files_load_as_uncalibrated() {
-        let dir = std::env::temp_dir().join(format!("sisyphus-v1-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("thehill-v1-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("old.bin");
         let model = Model::new(1);

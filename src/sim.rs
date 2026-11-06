@@ -103,7 +103,7 @@ mod tests {
 
     #[test]
     fn learns_to_target_slow_bigrams() {
-        let dir = std::env::temp_dir().join(format!("sisyphus-sim-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("thehill-sim-{}", std::process::id()));
         let slow = vec!["th".to_string(), "er".to_string()];
         let report = simulate(&dir, 60, &slow, true).unwrap();
         let mean = |r: &[(f64, f64, f64)]| r.iter().map(|x| x.2).sum::<f64>() / r.len() as f64;

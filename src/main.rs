@@ -11,11 +11,12 @@ mod voice;
 use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
 
-const USAGE: &str = "usage: sisyphus [--simulate N [--slow th,er]] [--retrain] [--stats] [--calibrate [N]]";
+const USAGE: &str = "usage: thehill [--simulate N [--slow th,er]] [--retrain] [--stats] [--calibrate [N]]";
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let flag = |name: &str| args.iter().position(|a| a == name).map(|i| args.get(i + 1));
+    storage::adopt_legacy_data().context("could not copy data over from Sisyphus")?;
     let dir = storage::data_dir();
 
     if let Some(n) = flag("--simulate") {
@@ -25,9 +26,9 @@ fn main() -> Result<()> {
             None => vec!["th".into(), "er".into()],
         };
         // Never mix synthetic runs into real data unless asked to.
-        let dir = match std::env::var_os("SISYPHUS_DATA_DIR") {
+        let dir = match std::env::var_os("THEHILL_DATA_DIR") {
             Some(d) => PathBuf::from(d),
-            None => std::env::temp_dir().join(format!("sisyphus-sim-{}", std::process::id())),
+            None => std::env::temp_dir().join(format!("thehill-sim-{}", std::process::id())),
         };
         println!("simulating {n} runs in {}", dir.display());
         sim::simulate(&dir, n, &slow, false)?;

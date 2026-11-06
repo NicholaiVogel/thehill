@@ -7,9 +7,42 @@ use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
 
 pub fn data_dir() -> PathBuf {
-    std::env::var_os("SISYPHUS_DATA_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| dirs::data_dir().expect("no data directory on this platform").join("sisyphus"))
+    std::env::var_os("THEHILL_DATA_DIR").map(PathBuf::from).unwrap_or_else(default_dir)
+}
+
+fn default_dir() -> PathBuf {
+    dirs::data_dir().expect("no data directory on this platform").join("thehill")
+}
+
+/// The app used to be called Sisyphus. On first launch under the new name, copies the old
+/// data over rather than moving it, so an old copy still running can't corrupt anything;
+/// the old directory is left for the user to delete.
+pub fn adopt_legacy_data() -> Result<()> {
+    let new = default_dir();
+    let old = new.with_file_name("sisyphus");
+    if std::env::var_os("THEHILL_DATA_DIR").is_some() || new.exists() || !old.join("sisyphus.db").exists() {
+        return Ok(());
+    }
+    let tmp = new.with_file_name("thehill.importing");
+    if tmp.exists() {
+        std::fs::remove_dir_all(&tmp)?;
+    }
+    std::fs::create_dir_all(tmp.join("checkpoints"))?;
+    // VACUUM INTO takes a consistent snapshot, WAL included, even with a live writer.
+    let target = tmp.join("thehill.db");
+    Connection::open(old.join("sisyphus.db"))?
+        .execute("VACUUM INTO ?1", [target.to_str().expect("data path is not UTF-8")])?;
+    if old.join("live.bin").exists() {
+        std::fs::copy(old.join("live.bin"), tmp.join("live.bin"))?;
+    }
+    for entry in std::fs::read_dir(old.join("checkpoints")).into_iter().flatten() {
+        let path = entry?.path();
+        if path.extension().is_some_and(|e| e == "bin") {
+            std::fs::copy(&path, tmp.join("checkpoints").join(path.file_name().unwrap()))?;
+        }
+    }
+    std::fs::rename(tmp, new)?;
+    Ok(())
 }
 
 pub struct Store {
@@ -92,7 +125,7 @@ fn key_from(code: &str) -> Key {
 impl Store {
     pub fn open(dir: &Path) -> Result<Store> {
         std::fs::create_dir_all(dir.join("checkpoints"))?;
-        let conn = Connection::open(dir.join("sisyphus.db"))?;
+        let conn = Connection::open(dir.join("thehill.db"))?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              CREATE TABLE IF NOT EXISTS runs (
@@ -386,7 +419,7 @@ mod tests {
 
     #[test]
     fn runs_round_trip() {
-        let dir = std::env::temp_dir().join(format!("sisyphus-store-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("thehill-store-{}", std::process::id()));
         let mut store = Store::open(&dir).unwrap();
         let events = vec![
             Event { t: 0.0, idx: 0, expected: Some('a'), key: Key::Char('a'), correct: true },

@@ -288,7 +288,7 @@ impl Session {
     /// Persists which lines the hill has said, so a restart doesn't bring them straight back.
     pub fn save_voice(&self) {
         if let Err(e) = self.store.set_setting("voice", &self.voice.history()) {
-            eprintln!("sisyphus: could not save the hill's memory: {e:#}");
+            eprintln!("thehill: could not save the hill's memory: {e:#}");
         }
     }
 
@@ -434,7 +434,7 @@ mod tests {
 
     #[test]
     fn old_checkpoints_are_recalibrated_when_selected() {
-        let dir = std::env::temp_dir().join(format!("sisyphus-oldcp-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("thehill-oldcp-{}", std::process::id()));
         let mut session = Session::open(&dir).unwrap();
         // As if an older binary froze it after this session started.
         let id = session
@@ -456,7 +456,7 @@ mod tests {
 
     #[test]
     fn hill_off_plays_random_common_words_in_silence() {
-        let dir = std::env::temp_dir().join(format!("sisyphus-hill-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("thehill-hill-{}", std::process::id()));
         let mut session = Session::open(&dir).unwrap();
         session.live = Some(Model::new(1));
         session.set_opponent(None).unwrap();
