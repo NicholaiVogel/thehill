@@ -17,8 +17,8 @@ const HIDDEN: usize = 64;
 const OUT: usize = 2;
 /// The most chars of context a model can see: the char itself and up to 11 before it.
 pub const MAX_CTX: usize = 12;
-/// The standard model: the char and the two before it.
-pub const DEFAULT_CTX: usize = 3;
+/// What new profiles start with: the char and the seven before it.
+pub const DEFAULT_CTX: usize = 8;
 /// Context lengths a profile can be created with.
 pub const CONTEXTS: [usize; 4] = [3, 5, 8, 12];
 const MAX_IN: usize = MAX_CTX * EMB + DENSE;
@@ -56,8 +56,7 @@ const MAX_INTERVAL_MS: f64 = 1500.0;
 const RECENCY_HALF_LIFE: f64 = 40.0;
 const EXPLORE_MS: f32 = 80.0;
 const DEFAULT_ERROR_MS: f32 = 600.0;
-/// v4 adds the context length; v3 has v2's layout (context 3); v2 files were calibrated on
-/// all runs and get recalibrated.
+/// Then the context length, error_ms, ms_scale, the weights and the seen counts.
 const MAGIC: &[u8] = b"SSPH\x04";
 const MIN_CALIBRATION_RUNS: usize = 8;
 /// Shorter than training's: the exchange rate should follow how you type now.
@@ -430,37 +429,27 @@ impl Model {
         std::fs::rename(tmp, path)
     }
 
-    /// Loads a model. The second value is false for the old format, whose cost calibration
-    /// is wrong; callers recalibrate those with `calibrate_cost` and save them again.
-    pub fn load_versioned(path: &Path) -> std::io::Result<(Model, bool)> {
+    pub fn load(path: &Path) -> std::io::Result<Model> {
         let bytes = std::fs::read(path)?;
         let not_a_model = || std::io::Error::other(format!("{} is not a model file", path.display()));
+        if bytes.len() < 17 || &bytes[..5] != MAGIC {
+            return Err(not_a_model());
+        }
         let f32_at = |i: usize| f32::from_le_bytes(bytes[i..i + 4].try_into().unwrap());
-        let body = |lay: Layout| 4 * lay.n + 4 * VOCAB * VOCAB;
-        // (layout, offset of error_ms, of ms_scale if stored, of the params, calibration current)
-        let three = Layout::new(DEFAULT_CTX);
-        let (lay, err_at, scale_at, start, current) = match bytes.get(..5) {
-            Some(m) if m == MAGIC && bytes.len() >= 9 => {
-                let ctx = u32::from_le_bytes(bytes[5..9].try_into().unwrap()) as usize;
-                if !(1..=MAX_CTX).contains(&ctx) {
-                    return Err(not_a_model());
-                }
-                (Layout::new(ctx), 9, Some(13), 17, true)
-            }
-            Some(b"SSPH\x03") => (three, 5, Some(9), 13, true),
-            Some(b"SSPH\x02") => (three, 5, Some(9), 13, false),
-            Some(b"SSPH\x01") => (three, 5, None, 9, false),
-            _ => return Err(not_a_model()),
-        };
-        if bytes.len() != start + body(lay) {
+        let ctx = u32::from_le_bytes(bytes[5..9].try_into().unwrap()) as usize;
+        if !(1..=MAX_CTX).contains(&ctx) {
+            return Err(not_a_model());
+        }
+        let lay = Layout::new(ctx);
+        if bytes.len() != 17 + 4 * lay.n + 4 * VOCAB * VOCAB {
             return Err(not_a_model());
         }
         let words = |b: &[u8]| -> Vec<[u8; 4]> { b.chunks_exact(4).map(|c| c.try_into().unwrap()).collect() };
-        let (params, seen) = bytes[start..].split_at(4 * lay.n);
+        let (params, seen) = bytes[17..].split_at(4 * lay.n);
         let model = Model {
             params: words(params).into_iter().map(f32::from_le_bytes).collect(),
-            error_ms: f32_at(err_at),
-            ms_scale: scale_at.map_or(1.0, f32_at),
+            error_ms: f32_at(9),
+            ms_scale: f32_at(13),
             seen: words(seen).into_iter().map(u32::from_le_bytes).collect(),
             lay,
         };
@@ -468,11 +457,7 @@ impl Model {
         if !finite || !model.params.iter().all(|p| p.is_finite()) {
             return Err(std::io::Error::other(format!("{} has non-finite weights", path.display())));
         }
-        Ok((model, current))
-    }
-
-    pub fn load(path: &Path) -> std::io::Result<Model> {
-        Self::load_versioned(path).map(|(m, _)| m)
+        Ok(model)
     }
 }
 
@@ -699,24 +684,6 @@ mod tests {
     }
 
     #[test]
-    fn old_model_files_load_as_uncalibrated() {
-        // v3 (context 3, current calibration) still loads as current.
-        let dir = std::env::temp_dir().join(format!("thehill-v3-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("v3.bin");
-        let model = Model::new(1);
-        model.save(&path).unwrap();
-        let mut bytes = std::fs::read(&path).unwrap();
-        bytes[4] = 3;
-        bytes.drain(5..9);
-        std::fs::write(&path, bytes).unwrap();
-        let (v3, current) = Model::load_versioned(&path).unwrap();
-        assert!(current && v3.context() == 3 && v3.params == model.params);
-        std::fs::remove_dir_all(dir).unwrap();
-        old_v1_files_load_as_uncalibrated();
-    }
-
-    #[test]
     fn longer_context_models_learn_save_and_backprop_correctly() {
         let mut model = Model::with_context(8, 5);
         // Gradient check through all eight context slots.
@@ -765,25 +732,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("long.bin");
         model.save(&path).unwrap();
-        let (loaded, current) = Model::load_versioned(&path).unwrap();
-        assert!(current && loaded.context() == 8 && loaded.params == model.params);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    fn old_v1_files_load_as_uncalibrated() {
-        let dir = std::env::temp_dir().join(format!("thehill-v1-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("old.bin");
-        let model = Model::new(1);
-        let mut bytes = b"SSPH\x01".to_vec();
-        bytes.extend(model.error_ms.to_le_bytes());
-        model.params.iter().for_each(|p| bytes.extend(p.to_le_bytes()));
-        model.seen.iter().for_each(|n| bytes.extend(n.to_le_bytes()));
-        std::fs::write(&path, bytes).unwrap();
-        let (old, current) = Model::load_versioned(&path).unwrap();
-        assert!(!current && old.ms_scale == 1.0);
-        old.save(&path).unwrap();
-        assert!(Model::load_versioned(&path).unwrap().1);
+        let loaded = Model::load(&path).unwrap();
+        assert!(loaded.context() == 8 && loaded.params == model.params);
+        std::fs::write(&path, b"SSPH\x04\x0d\0\0\0").unwrap();
+        assert!(Model::load(&path).is_err(), "context 13 is rejected");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

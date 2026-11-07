@@ -2,7 +2,7 @@
 
 use crate::hands::{self, Finger, Hands};
 use crate::learn::{self, CHECKPOINT_EVERY};
-use crate::model::{self, CONTEXTS, Model};
+use crate::model::{self, CONTEXTS, DEFAULT_CTX, Model};
 use crate::profiles::{self, Profile};
 use crate::session::{Finished, Mode, Run, Session, train};
 use crate::storage::Store;
@@ -658,7 +658,7 @@ impl TheHill {
                 "up" => pr.selected = pr.selected.saturating_sub(1),
                 "down" => pr.selected = (pr.selected + 1).min(pr.list.len().saturating_sub(1)),
                 "enter" if !id.is_empty() => return self.switch_profile(&id, cx),
-                "n" => pr.edit = Edit::Create(CONTEXTS.iter().position(|&c| c == 8).unwrap_or(0)),
+                "n" => pr.edit = Edit::Create(CONTEXTS.iter().position(|&c| c == DEFAULT_CTX).unwrap_or(0)),
                 "r" => pr.edit = Edit::Rename(pr.list.get(pr.selected).map(|p| p.name.clone()).unwrap_or_default()),
                 "d" if id == profiles::MAIN => pr.error = Some("the main profile can't be deleted".into()),
                 "d" => pr.edit = Edit::ConfirmDelete,

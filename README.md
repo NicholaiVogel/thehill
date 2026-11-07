@@ -62,7 +62,7 @@ The first 3 runs use plain common words while the model gets its first data.
 
 ## Data
 
-`~/.local/share/thehill` on Linux, `~/Library/Application Support/thehill` on macOS. Other profiles live in `profiles/` inside it. Data from the earlier name (Sisyphus) is copied over on first launch. Override with `THEHILL_DATA_DIR`.
+`~/.local/share/thehill` on Linux, `~/Library/Application Support/thehill` on macOS. Other profiles live in `profiles/` inside it. Override with `THEHILL_DATA_DIR`.
 
 - `thehill.db`: runs, keystrokes, checkpoints, settings
 - `live.bin`: current model

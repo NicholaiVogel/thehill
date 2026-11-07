@@ -14,37 +14,6 @@ fn default_dir() -> PathBuf {
     dirs::data_dir().expect("no data directory on this platform").join("thehill")
 }
 
-/// The app used to be called Sisyphus. On first launch under the new name, copies the old
-/// data over rather than moving it, so an old copy still running can't corrupt anything;
-/// the old directory is left for the user to delete.
-pub fn adopt_legacy_data() -> Result<()> {
-    let new = default_dir();
-    let old = new.with_file_name("sisyphus");
-    if std::env::var_os("THEHILL_DATA_DIR").is_some() || new.exists() || !old.join("sisyphus.db").exists() {
-        return Ok(());
-    }
-    let tmp = new.with_file_name("thehill.importing");
-    if tmp.exists() {
-        std::fs::remove_dir_all(&tmp)?;
-    }
-    std::fs::create_dir_all(tmp.join("checkpoints"))?;
-    // VACUUM INTO takes a consistent snapshot, WAL included, even with a live writer.
-    let target = tmp.join("thehill.db");
-    Connection::open(old.join("sisyphus.db"))?
-        .execute("VACUUM INTO ?1", [target.to_str().expect("data path is not UTF-8")])?;
-    if old.join("live.bin").exists() {
-        std::fs::copy(old.join("live.bin"), tmp.join("live.bin"))?;
-    }
-    for entry in std::fs::read_dir(old.join("checkpoints")).into_iter().flatten() {
-        let path = entry?.path();
-        if path.extension().is_some_and(|e| e == "bin") {
-            std::fs::copy(&path, tmp.join("checkpoints").join(path.file_name().unwrap()))?;
-        }
-    }
-    std::fs::rename(tmp, new)?;
-    Ok(())
-}
-
 pub struct Store {
     conn: Connection,
     dir: PathBuf,
@@ -171,7 +140,9 @@ impl Store {
                  raw REAL NOT NULL,
                  accuracy REAL NOT NULL,
                  predicted REAL NOT NULL,
-                 hill INTEGER NOT NULL DEFAULT 1
+                 hill INTEGER NOT NULL,
+                 boss INTEGER NOT NULL,
+                 model_predicted REAL NOT NULL
              );
              CREATE TABLE IF NOT EXISTS keys (
                  run_id INTEGER NOT NULL REFERENCES runs(id),
@@ -192,32 +163,6 @@ impl Store {
              );
              CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
         )?;
-        // Columns added after the first release.
-        for (column, default) in [("hill", 1), ("boss", 0)] {
-            let has: bool =
-                conn.query_row("SELECT COUNT(*) FROM pragma_table_info('runs') WHERE name = ?1", [column], |r| {
-                    r.get(0)
-                })?;
-            if !has {
-                conn.execute_batch(&format!(
-                    "ALTER TABLE runs ADD COLUMN {column} INTEGER NOT NULL DEFAULT {default}"
-                ))?;
-            }
-        }
-        // Every prediction before this column was the model's own, uncorrected.
-        let has_model_predicted: bool =
-            conn.query_row("SELECT COUNT(*) FROM pragma_table_info('runs') WHERE name = 'model_predicted'", [], |r| {
-                r.get(0)
-            })?;
-        if !has_model_predicted {
-            // One transaction, so an interrupted backfill is retried on the next launch.
-            conn.execute_batch(
-                "BEGIN;
-                 ALTER TABLE runs ADD COLUMN model_predicted REAL NOT NULL DEFAULT 0;
-                 UPDATE runs SET model_predicted = predicted;
-                 COMMIT;",
-            )?;
-        }
         Ok(Store { conn, dir: dir.to_path_buf() })
     }
 
@@ -291,14 +236,6 @@ impl Store {
         self.load_runs("SELECT id, text, wpm, hill FROM runs ORDER BY id DESC LIMIT ?1", limit as i64)
     }
 
-    /// The first `count` runs ever logged, oldest first: what a checkpoint frozen after
-    /// `count` runs was trained on.
-    pub fn first_runs(&self, count: i64) -> Result<Vec<RunLog>> {
-        let mut runs = self.load_runs("SELECT id, text, wpm, hill FROM runs ORDER BY id LIMIT ?1", count)?;
-        runs.reverse();
-        Ok(runs)
-    }
-
     /// Runs for a query yielding (id, text, wpm, hill), returned in reverse query order.
     fn load_runs(&self, sql: &str, param: i64) -> Result<Vec<RunLog>> {
         let mut runs = self.conn.prepare(sql)?;
@@ -342,11 +279,6 @@ impl Store {
         save(&self.checkpoint_path(id))?;
         tx.commit()?;
         Ok(id)
-    }
-
-    pub fn set_reference_wpm(&self, id: i64, wpm: f64) -> Result<()> {
-        self.conn.execute("UPDATE checkpoints SET reference_wpm = ?1 WHERE id = ?2", params![wpm, id])?;
-        Ok(())
     }
 
     pub fn checkpoints(&self) -> Result<Vec<Checkpoint>> {

@@ -18,7 +18,6 @@ const USAGE: &str =
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let flag = |name: &str| args.iter().position(|a| a == name).map(|i| args.get(i + 1));
-    storage::adopt_legacy_data().context("could not copy data over from Sisyphus")?;
     let dir = profiles::dir_of(&profiles::active());
 
     if let Some(n) = flag("--simulate") {
@@ -61,7 +60,6 @@ fn main() -> Result<()> {
 /// Compares the live model's predictions with what actually happened in the last `n` runs.
 fn calibrate(dir: &std::path::Path, n: usize) -> Result<()> {
     let store = storage::Store::open(dir)?;
-    learn::migrate(&store)?;
     let model = learn::load_live(&store).context("no live model")?;
     println!("error_ms {:.0}  ms_scale {:.3}", model.error_ms, model.ms_scale);
     println!(

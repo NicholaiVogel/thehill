@@ -173,7 +173,6 @@ pub struct Session {
 impl Session {
     pub fn open(dir: &Path) -> Result<Session> {
         let store = Store::open(dir)?;
-        learn::migrate(&store)?;
         let flag = |k: &str| store.setting(k).as_deref() == Some("1");
         let options = Options { punctuation: flag("punctuation"), numbers: flag("numbers") };
         let mode = store.setting("mode").and_then(|m| Mode::decode(&m)).unwrap_or(Mode::Time(15));
@@ -770,30 +769,6 @@ fn store_flag_default_on(store: &Store, key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn old_checkpoints_are_recalibrated_when_selected() {
-        let dir = std::env::temp_dir().join(format!("thehill-oldcp-{}", std::process::id()));
-        let mut session = Session::open(&dir).unwrap();
-        // As if an older binary froze it after this session started.
-        let id = session
-            .store
-            .add_checkpoint(0, &[], 1.0, |path| {
-                Model::new(1).save(path)?;
-                // v2: the same as v4 without the context length.
-                let mut bytes = std::fs::read(path)?;
-                bytes[4] = 2;
-                bytes.drain(5..9);
-                std::fs::write(path, bytes)
-            })
-            .unwrap();
-        session.set_opponent(Some(id)).unwrap();
-        assert_eq!(session.opponent_id, Some(id));
-        assert!(Model::load_versioned(&session.store.checkpoint_path(id)).unwrap().1, "rewritten as current");
-        let c = session.store.checkpoints().unwrap().into_iter().find(|c| c.id == id).unwrap();
-        assert!(c.reference_wpm > 1.0, "reference speed repaired");
-        std::fs::remove_dir_all(dir).unwrap();
-    }
 
     fn typed(words: &[&str], ms: impl Fn(usize) -> f64) -> Test {
         let mut t = Test::new(words.iter().map(|w| w.to_string()).collect());

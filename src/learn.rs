@@ -20,34 +20,9 @@ pub fn load_live(store: &Store) -> Option<Model> {
     Model::load(&store.live_model_path()).ok()
 }
 
-/// Recalibrates models saved before the cost calibration existed: the live model on the
-/// recent log, each checkpoint only on the runs it had seen when it was frozen.
-pub fn migrate(store: &Store) -> Result<()> {
-    let path = store.live_model_path();
-    if let Ok((mut model, false)) = Model::load_versioned(&path) {
-        model.calibrate_cost(&store.recent_runs(TRAIN_WINDOW)?);
-        model.save(&path)?;
-    }
-    for c in store.checkpoints()? {
-        load_checkpoint(store, c.id)?;
-    }
-    Ok(())
-}
-
-/// Loads a checkpoint, recalibrating it first if it was saved in an older format (an old
-/// binary still running can write one at any time). `None` if the file is missing or bad.
+/// Loads a checkpoint; `None` if the file is missing or bad.
 pub fn load_checkpoint(store: &Store, id: i64) -> Result<Option<Model>> {
-    let path = store.checkpoint_path(id);
-    let Ok((mut model, current)) = Model::load_versioned(&path) else { return Ok(None) };
-    if !current {
-        let Some(c) = store.checkpoints()?.into_iter().find(|c| c.id == id) else { return Ok(Some(model)) };
-        let runs = store.first_runs(c.run_count)?;
-        model.calibrate_cost(&runs[runs.len().saturating_sub(TRAIN_WINDOW)..]);
-        // Metadata first: if saving the model fails, the file stays old and this retries.
-        store.set_reference_wpm(id, reference_wpm(&model))?;
-        model.save(&path)?;
-    }
-    Ok(Some(model))
+    Ok(Model::load(&store.checkpoint_path(id)).ok())
 }
 
 /// Trains the live model on the log after a run and freezes a checkpoint every

@@ -108,7 +108,7 @@ pub fn create(context: usize, from: &Store) -> Result<Profile> {
         }
     }
     store.set_setting("context", &context.to_string())?;
-    let base = if context == DEFAULT_CTX { "fresh".to_string() } else { format!("context {context}") };
+    let base = format!("context {context}");
     let taken: Vec<String> = list().0.into_iter().map(|p| p.name).collect();
     let name = (1..)
         .map(|n| if n == 1 { base.clone() } else { format!("{base} ({n})") })
@@ -159,6 +159,7 @@ mod tests {
         main.set_setting("theme", "light").unwrap();
         main.set_setting("voice", "secret").unwrap();
 
+        assert_eq!(context(&main), DEFAULT_CTX);
         let p = create(8, &main).unwrap();
         assert_eq!((p.name.as_str(), p.context, p.runs), ("context 8", 8, 0));
         let store = Store::open(&dir_of(&p.id)).unwrap();
