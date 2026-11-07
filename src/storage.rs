@@ -65,6 +65,8 @@ pub struct RunRecord<'a> {
     pub hill: bool,
     /// A boss run: 25 words built from the hill's four worst trigrams.
     pub boss: bool,
+    /// The model's own prediction before correcting for how it picks text; 0 if none.
+    pub model_predicted: f64,
 }
 
 /// An earlier run a word appeared in.
@@ -193,6 +195,20 @@ impl Store {
                 ))?;
             }
         }
+        // Every prediction before this column was the model's own, uncorrected.
+        let has_model_predicted: bool =
+            conn.query_row("SELECT COUNT(*) FROM pragma_table_info('runs') WHERE name = 'model_predicted'", [], |r| {
+                r.get(0)
+            })?;
+        if !has_model_predicted {
+            // One transaction, so an interrupted backfill is retried on the next launch.
+            conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE runs ADD COLUMN model_predicted REAL NOT NULL DEFAULT 0;
+                 UPDATE runs SET model_predicted = predicted;
+                 COMMIT;",
+            )?;
+        }
         Ok(Store { conn, dir: dir.to_path_buf() })
     }
 
@@ -207,8 +223,8 @@ impl Store {
     pub fn save_run(&mut self, run: &RunRecord, events: &[Event]) -> Result<i64> {
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT INTO runs (started_at, mode, amount, punctuation, numbers, opponent, text, wpm, raw, accuracy, predicted, hill, boss)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            "INSERT INTO runs (started_at, mode, amount, punctuation, numbers, opponent, text, wpm, raw, accuracy, predicted, hill, boss, model_predicted)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 chrono::Utc::now().timestamp(),
                 run.mode,
@@ -222,7 +238,8 @@ impl Store {
                 run.accuracy,
                 run.predicted,
                 run.hill,
-                run.boss
+                run.boss,
+                run.model_predicted
             ],
         )?;
         let id = tx.last_insert_rowid();
@@ -326,9 +343,9 @@ impl Store {
     pub fn checkpoints(&self) -> Result<Vec<Checkpoint>> {
         let mut stmt = self.conn.prepare(
             "SELECT c.id, c.created_at, c.run_count, c.tags, c.reference_wpm,
-                    (SELECT wpm FROM runs WHERE opponent = c.id ORDER BY wpm DESC LIMIT 1),
-                    (SELECT predicted FROM runs WHERE opponent = c.id ORDER BY wpm DESC LIMIT 1),
-                    (SELECT COUNT(*) FROM runs WHERE opponent = c.id)
+                    (SELECT wpm FROM runs WHERE opponent = c.id AND hill = 1 AND predicted > 0 ORDER BY wpm DESC LIMIT 1),
+                    (SELECT predicted FROM runs WHERE opponent = c.id AND hill = 1 AND predicted > 0 ORDER BY wpm DESC LIMIT 1),
+                    (SELECT COUNT(*) FROM runs WHERE opponent = c.id AND hill = 1 AND predicted > 0)
              FROM checkpoints c ORDER BY c.id",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -374,6 +391,18 @@ impl Store {
     pub fn recent_results(&self, n: usize) -> Result<Vec<(f64, f64)>> {
         let mut stmt = self.conn.prepare(
             "SELECT wpm, predicted FROM runs WHERE predicted > 0 AND hill = 1 AND boss = 0 ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([n as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// (wpm, the model's own prediction) of the last `n` ordinary runs against the live hill,
+    /// newest first: what the prediction correction learns from.
+    pub fn model_results(&self, n: usize) -> Result<Vec<(f64, f64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT wpm, model_predicted FROM runs
+             WHERE model_predicted > 0 AND wpm > 0 AND hill = 1 AND boss = 0 AND opponent IS NULL
+             ORDER BY id DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map([n as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -501,6 +530,7 @@ mod tests {
             predicted: 90.0,
             hill: true,
             boss: false,
+            model_predicted: 90.0,
         };
         store.save_run(&run, &events).unwrap();
         let logs = store.recent_runs(5).unwrap();

@@ -45,6 +45,17 @@ pub type Opponent = (Arc<Model>, Arc<WordCosts>);
 
 /// Boss runs: every `CHECKPOINT_EVERY`th run against the live hill, this many words long.
 pub const BOSS_WORDS: u32 = 25;
+/// The hill picks the words it thinks are slowest for you, and some of those it has simply
+/// overrated, so on its own text it predicts low. Its committed predictions are corrected by
+/// how far off they've been lately: a weighted mean of log(actual / predicted) over this many
+/// recent ordinary runs, each run counting half as much as the one after it every
+/// `CORRECTION_HALF_LIFE` runs.
+const CORRECTION_RUNS: usize = 40;
+const CORRECTION_HALF_LIFE: f64 = 10.0;
+/// No correction until this many runs, and never more than this much either way.
+const CORRECTION_MIN_RUNS: usize = 8;
+const CORRECTION_LIMIT: (f64, f64) = (0.8, 1.4);
+
 /// The ghost is you as the checkpoint frozen about this many runs ago.
 const GHOST_RUNS_BACK: i64 = 50;
 /// The hill only brings up a word from a run at least this many runs back.
@@ -87,6 +98,8 @@ pub struct Run {
     /// The opponent's wpm prediction, committed and shown before the run starts; the run is
     /// judged against exactly this number. 0 without an opponent.
     pub predicted: f64,
+    /// The model's own prediction before the correction; what the correction learns from.
+    pub model_predicted: f64,
     /// When the opponent expects you to type each char, in ms from the first keystroke.
     pub pace: Vec<f32>,
     pub ghost: Option<Ghost>,
@@ -240,33 +253,46 @@ impl Session {
         };
         self.save_voice();
         let text: Vec<char> = test.text().chars().collect();
-        let commit = |m: &Model| {
-            let costs = m.costs(&text);
+        // Bosses pick words by trigram, not by expected cost, so they don't need correcting;
+        // nor do old checkpoints, which are you as you were.
+        let factor = if boss || self.opponent_id.is_some() { 1.0 } else { self.correction()? };
+        let commit = |m: &Model, factor: f64| {
+            let costs: Vec<f32> = m.costs(&text).into_iter().map(|c| c / factor as f32).collect();
             let wpm = match mode {
                 Mode::Words(_) => wpm_from_costs(&costs),
                 Mode::Time(s) => wpm_from_costs(expected_reach(&costs, s)),
             };
             (wpm, pace(&costs))
         };
-        let (predicted, pace) = self.opponent.as_ref().map(|(m, _)| commit(m)).unwrap_or_default();
+        // Only against the hill: with it off, or before it has seen enough, there's nothing
+        // honest to predict.
+        let (predicted, pace) = opponent.as_ref().map(|(m, _)| commit(m, factor)).unwrap_or_default();
+        let model_predicted = opponent.as_ref().map_or(0.0, |(m, _)| commit(m, 1.0).0);
         let ghost = if self.ghost && opponent.is_some() { self.ghost_model(runs)? } else { None };
         let ghost = ghost.map(|(label, m)| {
-            let (wpm, pace) = commit(&m);
+            let (wpm, pace) = commit(&m, 1.0);
             Ghost { label, pace, wpm }
         });
         Ok(Run {
             predicted,
+            model_predicted,
             pace,
             ghost,
             boss,
             test,
             generator,
             mode,
-            opponent_id: self.opponent_id,
+            // A checkpoint picked while the hill is off isn't being played.
+            opponent_id: self.opponent_id.filter(|_| opponent.is_some()),
             weak,
             preview,
             hill: self.hill,
         })
+    }
+
+    /// How much faster than the model's own prediction you've been typing its text lately.
+    fn correction(&self) -> Result<f64> {
+        Ok(correction(&self.store.model_results(CORRECTION_RUNS)?))
     }
 
     /// The checkpoint frozen about `GHOST_RUNS_BACK` runs ago, or the oldest one if there
@@ -331,6 +357,7 @@ impl Session {
                 predicted,
                 hill: run.hill,
                 boss: run.boss,
+                model_predicted: run.model_predicted,
             },
             &run.test.events,
         )?;
@@ -589,6 +616,20 @@ fn worst_word(test: &Test) -> Option<(String, f64)> {
         .max_by(|a, b| a.1.total_cmp(&b.1))
 }
 
+/// `results` are (wpm, model's prediction), newest first.
+fn correction(results: &[(f64, f64)]) -> f64 {
+    if results.len() < CORRECTION_MIN_RUNS {
+        return 1.0;
+    }
+    let (mut sum, mut weights) = (0.0, 0.0);
+    for (i, (wpm, predicted)) in results.iter().enumerate() {
+        let w = 0.5f64.powf(i as f64 / CORRECTION_HALF_LIFE);
+        sum += w * (wpm / predicted).ln();
+        weights += w;
+    }
+    (sum / weights).exp().clamp(CORRECTION_LIMIT.0, CORRECTION_LIMIT.1)
+}
+
 /// Cumulative time at which each char is typed, given per-keystroke costs; the first is free.
 fn pace(costs: &[f32]) -> Vec<f32> {
     let mut t = 0.0;
@@ -720,6 +761,17 @@ mod tests {
     }
 
     #[test]
+    fn correction_learns_how_far_off_the_hill_has_been() {
+        assert_eq!(correction(&[(66.0, 60.0); CORRECTION_MIN_RUNS - 1]), 1.0, "too few runs");
+        assert!((correction(&[(66.0, 60.0); 20]) - 1.1).abs() < 1e-9);
+        // Recent runs count more: lately on target, earlier 20% fast.
+        let mixed: Vec<(f64, f64)> = [(60.0, 60.0); 10].into_iter().chain([(72.0, 60.0); 30]).collect();
+        let c = correction(&mixed);
+        assert!(c > 1.0 && c < 1.1, "{c}");
+        assert_eq!(correction(&[(200.0, 60.0); 20]), CORRECTION_LIMIT.1, "capped");
+    }
+
+    #[test]
     fn graph_counts_only_what_the_score_counts() {
         // "hello cat" typed as "h cat": the skipped letters must not count.
         let mut t = Test::new(vec!["hello".into(), "cat".into()]);
@@ -792,6 +844,7 @@ mod tests {
                 predicted: 60.0,
                 hill: true,
                 boss: false,
+                model_predicted: 60.0,
             };
             s.store.save_run(&record, &t.events).unwrap();
         };
@@ -822,6 +875,7 @@ mod tests {
         session.hill = false;
         let run = session.new_run().unwrap();
         assert!(run.preview.is_empty() && run.weak.is_empty());
+        assert!(run.predicted == 0.0 && run.pace.is_empty(), "no prediction without the hill");
         let common = &crate::generator::words()[..1000];
         assert!(run.test.words.iter().all(|w| common.contains(&w.iter().collect::<String>().as_str())));
         std::fs::remove_dir_all(dir).unwrap();
