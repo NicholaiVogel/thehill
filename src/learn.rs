@@ -1,7 +1,7 @@
 //! Training after each run, checkpoints, and what a model says about you.
 
 use crate::generator::words;
-use crate::model::{Feat, Model};
+use crate::model::{Feat, Model, RunLog};
 use crate::storage::Store;
 use anyhow::Result;
 use rand::{SeedableRng, rngs::StdRng, seq::SliceRandom};
@@ -10,9 +10,8 @@ use std::sync::OnceLock;
 
 pub const CHECKPOINT_EVERY: i64 = 10;
 /// Older runs carry almost no weight after the recency decay, so they are not loaded.
-const TRAIN_WINDOW: usize = 300;
+pub const TRAIN_WINDOW: usize = 300;
 const EPOCHS: usize = 3;
-const RETRAIN_EPOCHS: usize = 10;
 /// Runs before the generator trusts the model.
 pub const COLD_RUNS: i64 = 3;
 
@@ -25,11 +24,21 @@ pub fn load_checkpoint(store: &Store, id: i64) -> Result<Option<Model>> {
     Ok(Model::load(&store.checkpoint_path(id)).ok())
 }
 
+/// A model trained from scratch on `window`, oldest first. Always from scratch, so every
+/// run gets the same few passes: continuing the previous model after each run drilled the
+/// newest runs hundreds of times and it overfit them (replayed on your log by `--evaluate`).
+/// The seed is the run count, so the same log always gives the same model.
+pub fn train(context: usize, window: &[RunLog], run_count: i64) -> Model {
+    let mut model = Model::with_context(context, run_count as u64);
+    model.fit(window, EPOCHS, run_count as u64);
+    model
+}
+
 /// Trains the live model on the log after a run and freezes a checkpoint every
 /// `CHECKPOINT_EVERY` runs. Returns the new live model and whether it froze a checkpoint.
-pub fn after_run(store: &Store, mut model: Model) -> Result<(Model, bool)> {
+pub fn after_run(store: &Store) -> Result<(Model, bool)> {
     let (runs, count) = store.training_snapshot(TRAIN_WINDOW)?;
-    model.fit(&runs, EPOCHS, count as u64);
+    let model = train(crate::profiles::context(store), &runs, count);
     model.save(&store.live_model_path())?;
     // Compare against the last checkpoint rather than `count % N == 0`: a run can be
     // logged while the previous one is still training, so the exact count can be skipped.
@@ -42,12 +51,21 @@ pub fn after_run(store: &Store, mut model: Model) -> Result<(Model, bool)> {
     Ok((model, freeze))
 }
 
-/// Rebuilds the live model from scratch from the whole log.
+/// Rebuilds the live model and every checkpoint from the log; each checkpoint is the model
+/// trained on the runs up to it.
 pub fn retrain(store: &Store) -> Result<Model> {
-    let mut model = Model::with_context(crate::profiles::context(store), 0);
-    let loss = model.fit(&store.recent_runs(usize::MAX)?, RETRAIN_EPOCHS, 0);
-    println!("retrained on {} runs, final loss {loss:.4}", store.run_count()?);
+    let context = crate::profiles::context(store);
+    let runs = store.recent_runs(usize::MAX)?;
+    let up_to = |n: usize| &runs[n.saturating_sub(TRAIN_WINDOW)..n];
+    let checkpoints = store.checkpoints()?;
+    for c in &checkpoints {
+        let model = train(context, up_to((c.run_count as usize).min(runs.len())), c.run_count);
+        model.save(&store.checkpoint_path(c.id))?;
+        store.update_checkpoint(c.id, &weaknesses(&model, 4), reference_wpm(&model))?;
+    }
+    let model = train(context, up_to(runs.len()), runs.len() as i64);
     model.save(&store.live_model_path())?;
+    eprintln!("thehill: rebuilt the model from {} runs, with {} checkpoints", runs.len(), checkpoints.len());
     Ok(model)
 }
 

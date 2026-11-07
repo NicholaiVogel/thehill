@@ -236,6 +236,14 @@ impl Store {
         self.load_runs("SELECT id, text, wpm, hill FROM runs ORDER BY id DESC LIMIT ?1", limit as i64)
     }
 
+    /// Every run's mode, amount, and whether it was a boss or against a checkpoint; oldest
+    /// first, like `recent_runs`.
+    pub fn run_kinds(&self) -> Result<Vec<(String, i64, bool, bool)>> {
+        let mut stmt = self.conn.prepare("SELECT mode, amount, boss, opponent IS NOT NULL FROM runs ORDER BY id")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     /// Runs for a query yielding (id, text, wpm, hill), returned in reverse query order.
     fn load_runs(&self, sql: &str, param: i64) -> Result<Vec<RunLog>> {
         let mut runs = self.conn.prepare(sql)?;
@@ -279,6 +287,14 @@ impl Store {
         save(&self.checkpoint_path(id))?;
         tx.commit()?;
         Ok(id)
+    }
+
+    pub fn update_checkpoint(&self, id: i64, tags: &[String], reference_wpm: f64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE checkpoints SET tags = ?1, reference_wpm = ?2 WHERE id = ?3",
+            params![tags.join(" "), reference_wpm, id],
+        )?;
+        Ok(())
     }
 
     pub fn checkpoints(&self) -> Result<Vec<Checkpoint>> {

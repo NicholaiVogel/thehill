@@ -79,7 +79,7 @@ pub fn simulate(dir: &Path, n: usize, slow: &[String], quiet: bool) -> Result<Re
         let share = share_with(&run.test.words, slow);
         typist.type_run(&mut run);
         let done = session.finish(&run)?;
-        let (model, costs, _) = train(dir, session.training_base())?;
+        let (model, costs, _) = train(dir)?;
         session.install(model, costs);
         report.runs.push((done.score.wpm, done.predicted, share));
         if !quiet && (i == 1 || i == n / 2 || i == n) {

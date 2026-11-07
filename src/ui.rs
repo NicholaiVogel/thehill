@@ -2,7 +2,7 @@
 
 use crate::hands::{self, Finger, Hands};
 use crate::learn::{self, CHECKPOINT_EVERY};
-use crate::model::{self, CONTEXTS, DEFAULT_CTX, Model};
+use crate::model::{CONTEXTS, DEFAULT_CTX};
 use crate::profiles::{self, Profile};
 use crate::session::{Finished, Mode, Run, Session, train};
 use crate::storage::Store;
@@ -422,17 +422,16 @@ impl TheHill {
 
     /// Trains the current profile on a background thread.
     fn train(&mut self, cx: &mut Context<Self>) {
-        let (dir, base) = (self.session.dir.clone(), self.session.training_base());
-        self.train_in(dir, base, cx);
+        self.train_in(self.session.dir.clone(), cx);
     }
 
     /// Trains the profile in `dir`, then any profile that finished a run meanwhile, the one
     /// you've switched away from included.
-    fn train_in(&mut self, dir: std::path::PathBuf, base: Model, cx: &mut Context<Self>) {
+    fn train_in(&mut self, dir: std::path::PathBuf, cx: &mut Context<Self>) {
         self.training = true;
         let worker_dir = dir.clone();
         cx.spawn(async move |this, cx| {
-            let result = cx.background_executor().spawn(async move { train(&worker_dir, base) }).await;
+            let result = cx.background_executor().spawn(async move { train(&worker_dir) }).await;
             this.update(cx, |this, cx| {
                 match result {
                     // Trained a profile you've since left: its model is saved there already.
@@ -448,15 +447,7 @@ impl TheHill {
                 this.training = false;
                 if !this.train_again.is_empty() {
                     let next = this.train_again.remove(0);
-                    let base = if next == this.session.dir {
-                        this.session.training_base()
-                    } else {
-                        // Its live model was saved by the training that just ran, or before.
-                        let store = Store::open_existing(&next).ok();
-                        let context = store.as_ref().map_or(model::DEFAULT_CTX, profiles::context);
-                        store.and_then(|s| learn::load_live(&s)).unwrap_or_else(|| Model::with_context(context, 0))
-                    };
-                    this.train_in(next, base, cx);
+                    this.train_in(next, cx);
                 }
                 cx.notify();
             })

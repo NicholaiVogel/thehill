@@ -33,6 +33,11 @@ impl Mode {
         Mode::ALL.into_iter().find(|m| m.encode() == s)
     }
 
+    /// From a run's stored mode and amount.
+    pub fn of_run(mode: &str, amount: i64) -> Option<Mode> {
+        Mode::decode(&format!("{mode} {amount}"))
+    }
+
     /// Words to generate up front.
     pub fn initial_words(self) -> usize {
         match self {
@@ -55,7 +60,7 @@ const HANDS_RUNS: usize = 100;
 /// how far off they've been lately: a weighted mean of log(actual / predicted) over this many
 /// recent ordinary runs, each run counting half as much as the one after it every
 /// `CORRECTION_HALF_LIFE` runs.
-const CORRECTION_RUNS: usize = 40;
+pub const CORRECTION_RUNS: usize = 40;
 const CORRECTION_HALF_LIFE: f64 = 10.0;
 /// No correction until this many runs, and never more than this much either way.
 const CORRECTION_MIN_RUNS: usize = 8;
@@ -178,7 +183,11 @@ impl Session {
         let mode = store.setting("mode").and_then(|m| Mode::decode(&m)).unwrap_or(Mode::Time(15));
         let hill = store.setting("hill").as_deref() != Some("0");
         let opponent_id = store.setting("opponent").and_then(|s| s.parse().ok());
-        let live = learn::load_live(&store);
+        // Models are built from the log, so one that's missing or unreadable is rebuilt.
+        let live = match learn::load_live(&store) {
+            None if store.run_count()? > 0 => Some(learn::retrain(&store)?),
+            live => live,
+        };
         let history = store.setting("voice").unwrap_or_default();
         let ghost = store_flag_default_on(&store, "ghost");
         let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos() as u64;
@@ -266,11 +275,7 @@ impl Session {
         // nor do old checkpoints, which are you as you were.
         let factor = if boss || self.opponent_id.is_some() { 1.0 } else { self.correction()? };
         let commit = |m: &Model, factor: f64| {
-            let costs: Vec<f32> = m.costs(&text).into_iter().map(|c| c / factor as f32).collect();
-            let wpm = match mode {
-                Mode::Words(_) => wpm_from_costs(&costs),
-                Mode::Time(s) => wpm_from_costs(expected_reach(&costs, s)),
-            };
+            let (wpm, costs) = committed(m, &text, mode, factor);
             (wpm, pace(&costs))
         };
         // Only against the hill: with it off, or before it has seen enough, there's nothing
@@ -524,11 +529,6 @@ impl Session {
         }
     }
 
-    /// The live model to continue training from.
-    pub fn training_base(&self) -> Model {
-        self.live.clone().unwrap_or_else(|| Model::with_context(crate::profiles::context(&self.store), 0))
-    }
-
     /// Installs a newly trained live model; if playing against live, it becomes the opponent.
     pub fn install(&mut self, model: Model, costs: WordCosts) {
         if self.opponent_id.is_none() {
@@ -554,9 +554,9 @@ impl Session {
 
 /// Trains on the log (opening its own connection so it can run on any thread) and prepares
 /// word costs for the new model. Also returns the hill's announcement if a checkpoint was frozen.
-pub fn train(dir: &Path, base: Model) -> Result<(Model, WordCosts, Option<String>)> {
+pub fn train(dir: &Path) -> Result<(Model, WordCosts, Option<String>)> {
     let store = Store::open_existing(dir)?;
-    let (model, froze) = learn::after_run(&store, base)?;
+    let (model, froze) = learn::after_run(&store)?;
     let announcement = if froze {
         let all = store.checkpoints()?;
         let got_past = match all.len().checked_sub(2).map(|i| &all[i]) {
@@ -580,6 +580,17 @@ fn mean_cost(model: &Model, word: &str) -> f32 {
 }
 
 /// Time mode: the keystroke costs the model expects you to get through in `seconds`.
+/// The wpm `model` expects on a run's opening text, scaled by the correction `factor`, as
+/// committed before the run; with the per-keystroke costs behind it.
+pub fn committed(model: &Model, text: &[char], mode: Mode, factor: f64) -> (f64, Vec<f32>) {
+    let costs: Vec<f32> = model.costs(text).into_iter().map(|c| c / factor as f32).collect();
+    let wpm = match mode {
+        Mode::Words(_) => wpm_from_costs(&costs),
+        Mode::Time(s) => wpm_from_costs(expected_reach(&costs, s)),
+    };
+    (wpm, costs)
+}
+
 fn expected_reach(costs: &[f32], seconds: u32) -> &[f32] {
     let budget = seconds as f32 * 1000.0;
     let mut spent = 0.0;
@@ -674,7 +685,7 @@ fn worst_word(test: &Test) -> Option<(String, f64)> {
 }
 
 /// `results` are (wpm, model's prediction), newest first.
-fn correction(results: &[(f64, f64)]) -> f64 {
+pub fn correction(results: &[(f64, f64)]) -> f64 {
     if results.len() < CORRECTION_MIN_RUNS {
         return 1.0;
     }

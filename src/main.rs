@@ -1,3 +1,4 @@
+mod eval;
 mod generator;
 mod hands;
 mod learn;
@@ -13,7 +14,7 @@ mod voice;
 use anyhow::{Context, Result, bail};
 
 const USAGE: &str =
-    "usage: thehill [--simulate N [--slow th,er]] [--retrain] [--stats] [--calibrate [N]] [--hands [N]]";
+    "usage: thehill [--simulate N [--slow th,er]] [--retrain] [--stats] [--calibrate [N]] [--hands [N]] [--evaluate]";
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -46,6 +47,9 @@ fn main() -> Result<()> {
     if let Some(n) = flag("--hands") {
         let n = n.map_or(Ok(usize::MAX), |n| n.parse()).context("--hands takes a run count")?;
         return print_hands(&dir, n);
+    }
+    if args.iter().any(|a| a == "--evaluate") {
+        return eval::evaluate(&dir);
     }
     if args.iter().any(|a| a == "--stats") {
         return stats(&dir);

@@ -56,6 +56,8 @@ const MAX_INTERVAL_MS: f64 = 1500.0;
 const RECENCY_HALF_LIFE: f64 = 40.0;
 const EXPLORE_MS: f32 = 80.0;
 const DEFAULT_ERROR_MS: f32 = 600.0;
+/// Pseudo-counts pulling a pair's base toward its char's, and a char's toward everyone's.
+const BASE_SMOOTHING: f64 = 5.0;
 /// Then the context length, error_ms, ms_scale, the weights and the seen counts.
 const MAGIC: &[u8] = b"SSPH\x04";
 const MIN_CALIBRATION_RUNS: usize = 8;
@@ -102,17 +104,17 @@ impl Feat {
     }
 
     /// The last `ctx` tokens, oldest first.
-    fn last(&self, ctx: usize) -> &[usize] {
+    pub fn last(&self, ctx: usize) -> &[usize] {
         &self.tokens[MAX_CTX - ctx..]
     }
 }
 
 pub struct Sample {
-    feat: Feat,
+    pub feat: Feat,
     /// ln(interval ms); `None` when the interval is unusable (run start, pause).
-    log_ms: Option<f32>,
-    error: bool,
-    weight: f32,
+    pub log_ms: Option<f32>,
+    pub error: bool,
+    pub weight: f32,
 }
 
 /// One completed run as stored: the full text, every keypress, and the scored wpm.
@@ -143,6 +145,10 @@ pub struct Model {
     pub ms_scale: f32,
     /// Training samples seen per (previous char, char) pair, for the exploration bonus.
     seen: Vec<u32>,
+    /// Per (previous char, char): how much slower in ln ms, and how much likelier an error in
+    /// logits, than your average keystroke, from smoothed counts. The network learns what
+    /// this table misses.
+    base: Vec<[f32; 2]>,
     lay: Layout,
 }
 
@@ -228,7 +234,14 @@ impl Model {
         init(lay.w3..lay.b3, xavier(HIDDEN, OUT));
         params[lay.b3] = 150f32.ln();
         params[lay.b3 + 1] = (0.05f32 / 0.95).ln();
-        Model { params, error_ms: DEFAULT_ERROR_MS, ms_scale: 1.0, seen: vec![0; VOCAB * VOCAB], lay }
+        Model {
+            params,
+            error_ms: DEFAULT_ERROR_MS,
+            ms_scale: 1.0,
+            seen: vec![0; VOCAB * VOCAB],
+            base: vec![[0.0; 2]; VOCAB * VOCAB],
+            lay,
+        }
     }
 
     /// How many chars of context this model sees, the char itself included.
@@ -247,6 +260,9 @@ impl Model {
         dense_forward(&p[l.w2..l.b2], &p[l.b2..l.w3], &a.a1, &mut a.z2);
         a.z2.iter().zip(a.a2.iter_mut()).for_each(|(z, a)| *a = silu(*z));
         dense_forward(&p[l.w3..l.b3], &p[l.b3..l.n], &a.a2, &mut a.out);
+        let b = self.base[f.pair()];
+        a.out[0] += b[0];
+        a.out[1] += b[1];
     }
 
     /// Predicted (interval ms, error probability) for one keystroke.
@@ -317,16 +333,16 @@ impl Model {
             loss += 0.5 * diff * diff;
             d[0] = diff;
         }
-        let p = sigmoid(a.out[1]);
-        let e = f32::from(s.error);
-        loss -= e * p.max(1e-7).ln() + (1.0 - e) * (1.0 - p).max(1e-7).ln();
-        d[1] = p - e;
+        // Cross-entropy from the logit, so the loss stays exact when the prediction is far off.
+        let (z, e) = (a.out[1], f32::from(s.error));
+        loss += z.max(0.0) - z * e + (-z.abs()).exp().ln_1p();
+        d[1] = sigmoid(z) - e;
         self.backward(&s.feat, a, d.map(|v| v * s.weight), g);
         loss * s.weight
     }
 
-    /// Trains on the logged runs (oldest first), warm-starting from the current weights.
-    /// Returns the final epoch's mean loss.
+    /// Trains on the logged runs (oldest first): refits the pair table, then the network on
+    /// what the table misses. Returns the final epoch's mean loss.
     pub fn fit(&mut self, runs: &[RunLog], epochs: usize, seed: u64) -> f32 {
         let mut samples = Vec::new();
         for (age, run) in runs.iter().rev().enumerate() {
@@ -339,29 +355,66 @@ impl Model {
         for s in &samples {
             self.seen[s.feat.pair()] += 1;
         }
+        self.fit_base(&samples);
 
         let mut rng = StdRng::seed_from_u64(seed);
         let mut adam = Adam::new(self.lay.n);
         let mut grad = vec![0.0; self.lay.n];
         let mut acts = Acts::new();
+        // Batches are scaled by the mean weight of the whole log, not their own, so an old
+        // sample counts for as little in a small batch as in a big one.
+        let mean_w = samples.iter().map(|s| s.weight as f64).sum::<f64>() / samples.len() as f64;
         let mut last_loss = 0.0;
         for _ in 0..epochs {
             samples.shuffle(&mut rng);
             let (mut total, mut weight) = (0.0, 0.0);
             for batch in samples.chunks(256) {
                 grad.fill(0.0);
-                let w: f32 = batch.iter().map(|s| s.weight).sum();
                 for s in batch {
                     total += self.sample_grad(s, &mut acts, &mut grad);
                 }
-                weight += w;
-                grad.iter_mut().for_each(|g| *g /= w);
+                weight += batch.iter().map(|s| s.weight).sum::<f32>();
+                let scale = (mean_w * batch.len() as f64) as f32;
+                grad.iter_mut().for_each(|g| *g /= scale);
                 adam.step(&mut self.params, &grad);
             }
             last_loss = total / weight;
         }
         self.calibrate_cost(runs);
         last_loss
+    }
+
+    /// Recency-weighted means per pair, each pulled toward its char's mean, which is pulled
+    /// toward the overall mean.
+    fn fit_base(&mut self, samples: &[Sample]) {
+        // Σw·ln ms, Σw timed, Σw·error, Σw
+        let mut pair = vec![[0.0f64; 4]; VOCAB * VOCAB];
+        for s in samples {
+            let w = s.weight as f64;
+            let e = &mut pair[s.feat.pair()];
+            if let Some(y) = s.log_ms {
+                e[0] += w * y as f64;
+                e[1] += w;
+            }
+            e[2] += w * f64::from(u8::from(s.error));
+            e[3] += w;
+        }
+        let mut char_sums = vec![[0.0f64; 4]; VOCAB];
+        pair.iter().enumerate().for_each(|(i, e)| (0..4).for_each(|k| char_sums[i % VOCAB][k] += e[k]));
+        let mut all = [0.0f64; 4];
+        char_sums.iter().for_each(|e| (0..4).for_each(|k| all[k] += e[k]));
+        let shrink = |e: &[f64; 4], prior: (f64, f64)| {
+            (
+                (e[0] + BASE_SMOOTHING * prior.0) / (e[1] + BASE_SMOOTHING),
+                (e[2] + BASE_SMOOTHING * prior.1) / (e[3] + BASE_SMOOTHING),
+            )
+        };
+        let overall = shrink(&all, (150f64.ln(), 0.05));
+        let logit = |p: f64| (p / (1.0 - p)).ln();
+        for (i, e) in pair.iter().enumerate() {
+            let (ms, p) = shrink(e, shrink(&char_sums[i % VOCAB], overall));
+            self.base[i] = [(ms - overall.0) as f32, (logit(p) - logit(overall.1)) as f32];
+        }
     }
 
     /// Fits `ms_scale` and `error_ms` so that predicted wpm matches scored wpm on the log.
@@ -424,6 +477,7 @@ impl Model {
         bytes.extend(self.ms_scale.to_le_bytes());
         self.params.iter().for_each(|p| bytes.extend(p.to_le_bytes()));
         self.seen.iter().for_each(|n| bytes.extend(n.to_le_bytes()));
+        self.base.iter().flatten().for_each(|b| bytes.extend(b.to_le_bytes()));
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, bytes)?;
         std::fs::rename(tmp, path)
@@ -441,20 +495,23 @@ impl Model {
             return Err(not_a_model());
         }
         let lay = Layout::new(ctx);
-        if bytes.len() != 17 + 4 * lay.n + 4 * VOCAB * VOCAB {
+        if bytes.len() != 17 + 4 * lay.n + 12 * VOCAB * VOCAB {
             return Err(not_a_model());
         }
         let words = |b: &[u8]| -> Vec<[u8; 4]> { b.chunks_exact(4).map(|c| c.try_into().unwrap()).collect() };
-        let (params, seen) = bytes[17..].split_at(4 * lay.n);
+        let (params, rest) = bytes[17..].split_at(4 * lay.n);
+        let (seen, base) = rest.split_at(4 * VOCAB * VOCAB);
+        let base: Vec<f32> = words(base).into_iter().map(f32::from_le_bytes).collect();
         let model = Model {
             params: words(params).into_iter().map(f32::from_le_bytes).collect(),
             error_ms: f32_at(9),
             ms_scale: f32_at(13),
             seen: words(seen).into_iter().map(u32::from_le_bytes).collect(),
+            base: base.chunks_exact(2).map(|b| [b[0], b[1]]).collect(),
             lay,
         };
         let finite = model.error_ms.is_finite() && model.ms_scale.is_finite();
-        if !finite || !model.params.iter().all(|p| p.is_finite()) {
+        if !finite || !model.params.iter().chain(model.base.iter().flatten()).all(|p| p.is_finite()) {
             return Err(std::io::Error::other(format!("{} has non-finite weights", path.display())));
         }
         Ok(model)
@@ -492,7 +549,7 @@ impl Model {
     }
 }
 
-fn recency(age: usize) -> f32 {
+pub fn recency(age: usize) -> f32 {
     0.5f64.powf(age as f64 / RECENCY_HALF_LIFE) as f32
 }
 
@@ -506,7 +563,7 @@ pub fn wpm_from_costs(costs: &[f32]) -> f64 {
 
 /// Turns one run's keypresses into training samples: the first attempt at each text position.
 /// Intervals after an error or correction are dropped, since they measure recovery, not typing.
-fn extract(text: &[char], events: &[Event], weight: f32, out: &mut Vec<Sample>) {
+pub fn extract(text: &[char], events: &[Event], weight: f32, out: &mut Vec<Sample>) {
     let mut attempted = HashSet::new();
     let mut prev: Option<(f64, bool)> = None;
     for e in events {
@@ -595,6 +652,26 @@ mod tests {
     }
 
     #[test]
+    fn error_loss_stays_exact_when_confidently_wrong() {
+        let text = chars("the cat");
+        let mut model = Model::new(3);
+        let sample = Sample { feat: Feat::at(&text, 5), log_ms: None, error: true, weight: 1.0 };
+        let l = model.lay;
+        model.params[l.b3 + 1] -= 30.0;
+        let at = |model: &Model, bias: f32| {
+            let mut m = model.clone();
+            m.params[l.b3 + 1] = bias;
+            m.sample_grad(&sample, &mut Acts::new(), &mut vec![0.0; l.n])
+        };
+        let b = model.params[l.b3 + 1];
+        let mut grad = vec![0.0; l.n];
+        let loss = model.sample_grad(&sample, &mut Acts::new(), &mut grad);
+        assert!(loss > 25.0, "a logit near -30 for an error costs ~30, not a clipped 16: {loss}");
+        let numeric = (at(&model, b + 0.1) - at(&model, b - 0.1)) / 0.2;
+        assert!((numeric - grad[l.b3 + 1]).abs() < 1e-2, "{numeric} vs {}", grad[l.b3 + 1]);
+    }
+
+    #[test]
     fn save_and_load_give_identical_predictions() {
         let dir = std::env::temp_dir().join(format!("thehill-model-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -658,6 +735,34 @@ mod tests {
         let th = model.predict(&Feat::at(&text, 1)).0;
         let as_ = model.predict(&Feat::at(&text, 5)).0;
         assert!(th > 2.0 * as_, "t→h {th} vs a→s {as_}");
+    }
+
+    #[test]
+    fn the_pair_table_knows_a_slow_pair_before_the_network_does() {
+        let text = chars("the as the as the as the as");
+        let events: Vec<Event> = {
+            let mut t = 0.0;
+            text.iter()
+                .enumerate()
+                .map(|(i, &c)| {
+                    t += if i > 0 && text[i - 1] == 't' { 300.0 } else { 90.0 };
+                    Event { t, idx: i, expected: Some(c), key: Key::Char(c), correct: true }
+                })
+                .collect()
+        };
+        let runs: Vec<RunLog> =
+            (0..3).map(|_| RunLog { text: text.clone(), events: events.clone(), wpm: 100.0, hill: true }).collect();
+        // No passes at all: everything it knows is the table.
+        let mut model = Model::new(1);
+        model.fit(&runs, 0, 1);
+        let (th, as_) = (model.base[Feat::at(&text, 1).pair()][0], model.base[Feat::at(&text, 5).pair()][0]);
+        assert!(th > 0.5 && as_ < 0.0, "t→h {th} and a→s {as_} against the average, in ln ms");
+        assert!(model.predict(&Feat::at(&text, 1)).0 > 1.8 * model.predict(&Feat::at(&text, 5)).0);
+        let dir = std::env::temp_dir().join(format!("thehill-base-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        model.save(&dir.join("m.bin")).unwrap();
+        assert_eq!(Model::load(&dir.join("m.bin")).unwrap().base, model.base);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
