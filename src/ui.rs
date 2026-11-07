@@ -1,7 +1,10 @@
 //! The window: config bar, typing area, results, the slope, and the hill's voice.
 
 use crate::learn::{self, CHECKPOINT_EVERY};
+use crate::model::{self, CONTEXTS, Model};
+use crate::profiles::{self, Profile};
 use crate::session::{Finished, Mode, Run, Session, train};
+use crate::storage::Store;
 use crate::storage::{Checkpoint, Lifetime};
 use crate::typing::{Key, Test};
 use crate::voice::Heckle;
@@ -98,6 +101,24 @@ enum Screen {
         shown: Vec<Instant>,
     },
     Stats(Stats),
+    Profiles(Profiles),
+}
+
+/// The profiles screen: every profile, which one is selected, and any edit in progress.
+struct Profiles {
+    list: Vec<Profile>,
+    selected: usize,
+    edit: Edit,
+    error: Option<String>,
+}
+
+enum Edit {
+    None,
+    Rename(String),
+    /// Choosing the new profile's context length: an index into `CONTEXTS`.
+    Create(usize),
+    /// `d` was pressed once; a second press deletes.
+    ConfirmDelete,
 }
 
 /// The stats screen: lifetime numbers, the checkpoint slope, and the selected model's view of you.
@@ -183,6 +204,8 @@ fn revealed(since: Instant, now: Instant) -> usize {
 
 struct TheHill {
     session: Session,
+    /// The profile in use: (id, name).
+    profile: (String, String),
     run: Run,
     screen: Screen,
     focus: FocusHandle,
@@ -192,7 +215,8 @@ struct TheHill {
     font: SharedString,
     zoom: f32,
     training: bool,
-    train_again: bool,
+    /// Profiles (by data dir) with runs finished while training was busy, oldest first.
+    train_again: Vec<std::path::PathBuf>,
     speech: Option<Speech>,
     /// Said at the next opportunity: a checkpoint announced mid-run.
     pending: Option<String>,
@@ -225,9 +249,12 @@ pub fn run(session: Session) {
                 let zoom = session.store.setting("zoom").and_then(|z| z.parse().ok()).map_or(1.0, normalize_zoom);
                 LIGHT_MODE.store(session.store.setting("theme").as_deref() == Some("light"), Ordering::Relaxed);
                 let run = session.new_run().expect("could not start a run");
+                let id = profiles::active();
+                let profile = (id.clone(), profiles::name(&session.store, &id));
                 let speech = Some(Speech::new(run.preview.clone()));
                 let app = TheHill {
                     session,
+                    profile,
                     run,
                     screen: Screen::Typing,
                     focus,
@@ -237,7 +264,7 @@ pub fn run(session: Session) {
                     font: family.into(),
                     zoom,
                     training: false,
-                    train_again: false,
+                    train_again: Vec::new(),
                     speech,
                     pending: None,
                     last_heckle: None,
@@ -301,7 +328,7 @@ impl TheHill {
             }
         }
         // Repaint for the countdown, the caret blink and the hill's lines.
-        if !matches!(self.screen, Screen::Stats(_)) {
+        if !matches!(self.screen, Screen::Stats(_) | Screen::Profiles(_)) {
             cx.notify();
         }
     }
@@ -348,22 +375,32 @@ impl TheHill {
         self.started = None;
         self.speech = None;
         if self.training {
-            self.train_again = true;
+            if !self.train_again.contains(&self.session.dir) {
+                self.train_again.push(self.session.dir.clone());
+            }
         } else {
             self.train(cx);
         }
         cx.notify();
     }
 
-    /// Trains on a background thread; runs again if another run finished meanwhile.
+    /// Trains the current profile on a background thread.
     fn train(&mut self, cx: &mut Context<Self>) {
+        let (dir, base) = (self.session.dir.clone(), self.session.training_base());
+        self.train_in(dir, base, cx);
+    }
+
+    /// Trains the profile in `dir`, then any profile that finished a run meanwhile, the one
+    /// you've switched away from included.
+    fn train_in(&mut self, dir: std::path::PathBuf, base: Model, cx: &mut Context<Self>) {
         self.training = true;
-        let dir = self.session.dir.clone();
-        let base = self.session.training_base();
+        let worker_dir = dir.clone();
         cx.spawn(async move |this, cx| {
-            let result = cx.background_executor().spawn(async move { train(&dir, base) }).await;
+            let result = cx.background_executor().spawn(async move { train(&worker_dir, base) }).await;
             this.update(cx, |this, cx| {
                 match result {
+                    // Trained a profile you've since left: its model is saved there already.
+                    Ok(_) if this.session.dir != dir => {}
                     Ok((model, costs, announcement)) => {
                         this.session.install(model, costs);
                         if let Some(line) = announcement.filter(|_| this.session.hill) {
@@ -373,8 +410,17 @@ impl TheHill {
                     Err(e) => eprintln!("thehill: training failed: {e:#}"),
                 }
                 this.training = false;
-                if std::mem::take(&mut this.train_again) {
-                    this.train(cx);
+                if !this.train_again.is_empty() {
+                    let next = this.train_again.remove(0);
+                    let base = if next == this.session.dir {
+                        this.session.training_base()
+                    } else {
+                        // Its live model was saved by the training that just ran, or before.
+                        let store = Store::open_existing(&next).ok();
+                        let context = store.as_ref().map_or(model::DEFAULT_CTX, profiles::context);
+                        store.and_then(|s| learn::load_live(&s)).unwrap_or_else(|| Model::with_context(context, 0))
+                    };
+                    this.train_in(next, base, cx);
                 }
                 cx.notify();
             })
@@ -383,7 +429,6 @@ impl TheHill {
         .detach();
     }
 
-    /// Says `line` now if there's room for it, otherwise at the next results or run.
     fn announce(&mut self, line: String) {
         match &mut self.screen {
             Screen::Results { done, shown } => {
@@ -479,6 +524,113 @@ impl TheHill {
         cx.notify();
     }
 
+    fn open_profiles(&mut self, cx: &mut Context<Self>) {
+        let (list, error) = profiles::list();
+        let selected = list.iter().position(|p| p.id == self.profile.0).unwrap_or(0);
+        self.started = None;
+        self.screen = Screen::Profiles(Profiles { list, selected, edit: Edit::None, error });
+        cx.notify();
+    }
+
+    /// Reloads the list after a change, keeping the selection on `select` if it still exists.
+    fn refresh_profiles(&mut self, select: Option<&str>, error: Option<String>, cx: &mut Context<Self>) {
+        let (list, broken) = profiles::list();
+        let Screen::Profiles(pr) = &mut self.screen else { return };
+        let keep = select.and_then(|id| list.iter().position(|p| p.id == id));
+        pr.selected = keep.unwrap_or(pr.selected).min(list.len().saturating_sub(1));
+        pr.list = list;
+        pr.edit = Edit::None;
+        pr.error = error.or(broken);
+        cx.notify();
+    }
+
+    fn switch_profile(&mut self, id: &str, cx: &mut Context<Self>) {
+        let session = match Session::open(&profiles::dir_of(id)) {
+            Ok(s) => s,
+            Err(e) => return self.refresh_profiles(None, Some(format!("couldn't open it: {e:#}")), cx),
+        };
+        // The look stays as it is; only what you play and what the hill knows change.
+        let light = LIGHT_MODE.load(Ordering::Relaxed);
+        let _ = session.store.set_setting("theme", if light { "light" } else { "dark" });
+        let _ = session.store.set_setting("zoom", &format!("{:.1}", self.zoom));
+        if let Err(e) = profiles::set_active(id) {
+            eprintln!("thehill: could not remember the profile: {e:#}");
+        }
+        self.profile = (id.to_string(), profiles::name(&session.store, id));
+        self.session = session;
+        self.pending = None;
+        self.new_run(cx);
+    }
+
+    fn profiles_key(&mut self, key: &str, typed: Option<&str>, cx: &mut Context<Self>) {
+        let Screen::Profiles(pr) = &mut self.screen else { return };
+        let id = pr.list.get(pr.selected).map(|p| p.id.clone()).unwrap_or_default();
+        // A message stays up until the next key.
+        pr.error = None;
+        // Nothing selected (no profile could be read): only creating and leaving make sense.
+        if id.is_empty() && !matches!(pr.edit, Edit::Create(_)) && !matches!(key, "n" | "escape") {
+            return;
+        }
+        match &mut pr.edit {
+            Edit::Rename(name) => match key {
+                "enter" => {
+                    let name = name.trim().to_string();
+                    let result = profiles::rename(&id, &name);
+                    if result.is_ok() && id == self.profile.0 {
+                        self.profile.1 = name;
+                    }
+                    return self.refresh_profiles(Some(&id), result.err().map(|e| e.to_string()), cx);
+                }
+                "escape" => pr.edit = Edit::None,
+                "backspace" => {
+                    name.pop();
+                }
+                _ => {
+                    if let Some(t) = typed.filter(|t| t.chars().all(|c| !c.is_control())) {
+                        name.push_str(t);
+                        name.truncate(name.char_indices().nth(40).map_or(name.len(), |(i, _)| i));
+                    }
+                }
+            },
+            Edit::Create(i) => match key {
+                "left" => *i = i.saturating_sub(1),
+                "right" => *i = (*i + 1).min(CONTEXTS.len() - 1),
+                "enter" => {
+                    let context = CONTEXTS[*i];
+                    match profiles::create(context, &self.session.store) {
+                        Ok(p) => return self.switch_profile(&p.id, cx),
+                        Err(e) => return self.refresh_profiles(None, Some(format!("couldn't create it: {e:#}")), cx),
+                    }
+                }
+                "escape" => pr.edit = Edit::None,
+                _ => {}
+            },
+            Edit::ConfirmDelete => match key {
+                "d" => {
+                    let error = profiles::delete(&id).err().map(|e| e.to_string());
+                    if error.is_none() && id == self.profile.0 {
+                        self.switch_profile(profiles::MAIN, cx);
+                        return self.open_profiles(cx);
+                    }
+                    return self.refresh_profiles(None, error, cx);
+                }
+                _ => pr.edit = Edit::None,
+            },
+            Edit::None => match key {
+                "up" => pr.selected = pr.selected.saturating_sub(1),
+                "down" => pr.selected = (pr.selected + 1).min(pr.list.len().saturating_sub(1)),
+                "enter" if !id.is_empty() => return self.switch_profile(&id, cx),
+                "n" => pr.edit = Edit::Create(CONTEXTS.iter().position(|&c| c == 8).unwrap_or(0)),
+                "r" => pr.edit = Edit::Rename(pr.list.get(pr.selected).map(|p| p.name.clone()).unwrap_or_default()),
+                "d" if id == profiles::MAIN => pr.error = Some("the main profile can't be deleted".into()),
+                "d" => pr.edit = Edit::ConfirmDelete,
+                "escape" => return self.new_run(cx),
+                _ => {}
+            },
+        }
+        cx.notify();
+    }
+
     fn choose_opponent(&mut self, id: Option<i64>, cx: &mut Context<Self>) {
         if let Err(e) = self.session.set_opponent(id).and_then(|_| self.session.save_settings()) {
             eprintln!("thehill: could not switch opponent: {e:#}");
@@ -521,6 +673,7 @@ impl TheHill {
         if m.control {
             match ks.key.as_str() {
                 "s" => return self.open_stats(cx),
+                "p" if !self.running() => return self.open_profiles(cx),
                 "h" if !self.running() => return self.change_settings(cx, |s| s.hill ^= true),
                 "t" => return self.toggle_theme(cx),
                 "g" if !self.running() => return self.change_settings(cx, |s| s.ghost ^= true),
@@ -531,6 +684,13 @@ impl TheHill {
             }
         }
         match &mut self.screen {
+            Screen::Profiles(_) => {
+                let typed = ks.key_char.clone();
+                self.profiles_key(ks.key.as_str(), typed.as_deref(), cx);
+                window.prevent_default();
+                cx.stop_propagation();
+                return;
+            }
             Screen::Stats(st) => {
                 let (selected, id) = (st.selected, st.checkpoints.get(st.selected).map(|c| c.id));
                 match ks.key.as_str() {
@@ -657,6 +817,14 @@ impl TheHill {
                     }
                 }),
             ))
+            .child(divider())
+            .child(item("profile", self.profile.1.clone(), false).on_click(cx.listener(
+                |this, _: &ClickEvent, _, cx| {
+                    if !this.running() {
+                        this.open_profiles(cx)
+                    }
+                },
+            )))
             .child(divider())
             .child(
                 item("theme", if LIGHT_MODE.load(Ordering::Relaxed) { "light" } else { "dark" }.into(), false)
@@ -935,6 +1103,82 @@ impl TheHill {
                     .children(lines),
             )
             .child(insights)
+    }
+
+    fn render_profiles(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let Screen::Profiles(pr) = &self.screen else { unreachable!() };
+        let small = |text: String| div().text_size(self.z(12.0)).text_color(color(pal().untyped)).child(text);
+        let rows = pr.list.iter().enumerate().map(|(i, p)| {
+            let selected = i == pr.selected;
+            let current = p.id == self.profile.0;
+            let name = match (&pr.edit, selected) {
+                (Edit::Rename(buffer), true) => format!("{buffer}▏"),
+                _ => p.name.clone(),
+            };
+            let runs = if p.runs == 1 { "1 run".to_string() } else { format!("{} runs", p.runs) };
+            let detail =
+                format!("{} chars of context  ·  {runs}{}", p.context, if current { "  ·  in use" } else { "" });
+            div()
+                .id(i)
+                .cursor_pointer()
+                .flex()
+                .items_baseline()
+                .gap(self.z(16.0))
+                .child(div().w(self.z(16.0)).text_color(color(pal().accent)).child(if current { "•" } else { "" }))
+                .child(
+                    div()
+                        .text_size(self.z(20.0))
+                        .text_color(color(if selected { pal().accent } else { pal().untyped }))
+                        .child(name),
+                )
+                .child(small(detail))
+                .on_click(cx.listener(move |this, e: &ClickEvent, _, cx| {
+                    let Screen::Profiles(pr) = &mut this.screen else { return };
+                    if !matches!(pr.edit, Edit::None) {
+                        return;
+                    }
+                    if pr.selected == i || e.click_count() == 2 {
+                        pr.selected = i;
+                        this.profiles_key("enter", None, cx);
+                    } else {
+                        pr.selected = i;
+                        cx.notify();
+                    }
+                }))
+        });
+        let selected_name = pr.list.get(pr.selected).map(|p| p.name.clone()).unwrap_or_default();
+        let status = match &pr.edit {
+            Edit::None => pr.error.clone().unwrap_or_default(),
+            Edit::Rename(_) => "type a name  ·  enter save  ·  esc cancel".into(),
+            Edit::ConfirmDelete => {
+                format!("press d again to delete {selected_name}. its runs move to the trash folder.")
+            }
+            Edit::Create(i) => {
+                let choices: Vec<String> = CONTEXTS
+                    .iter()
+                    .enumerate()
+                    .map(|(k, c)| if k == *i { format!("[{c}]") } else { c.to_string() })
+                    .collect();
+                format!(
+                    "new profile, starting from scratch. chars of context: {}  ·  ← → choose  ·  enter create  ·  esc cancel",
+                    choices.join("  ")
+                )
+            }
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap(self.z(20.0))
+            .child(div().text_size(self.z(12.0)).text_color(color(pal().untyped)).child("profiles"))
+            .child(div().flex().flex_col().gap(self.z(12.0)).children(rows))
+            .child(
+                div()
+                    .h(self.z(16.0))
+                    .text_size(self.z(12.0))
+                    .text_color(color(if pr.error.is_some() { pal().error } else { pal().correct }))
+                    .child(status),
+            )
+            .child(small("↑ ↓ choose  ·  enter switch  ·  n new  ·  r rename  ·  d delete  ·  esc back".into()))
     }
 
     fn render_stats(&self, width: f32, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1363,13 +1607,14 @@ impl Render for TheHill {
                 .into_any_element(),
             Screen::Results { done, shown } => self.render_results(done, shown, width, window).into_any_element(),
             Screen::Stats(_) => self.render_stats(width, cx).into_any_element(),
+            Screen::Profiles(_) => self.render_profiles(cx).into_any_element(),
         };
         let hint = match self.screen {
             Screen::Typing => {
-                "tab new text  ·  esc restart  ·  ctrl+s stats  ·  ctrl+h hill  ·  ctrl+g ghost  ·  ctrl+t theme  ·  ctrl +/- zoom"
+                "tab new text  ·  esc restart  ·  ctrl+s stats  ·  ctrl+h hill  ·  ctrl+g ghost  ·  ctrl+p profiles  ·  ctrl+t theme  ·  ctrl +/- zoom"
             }
             Screen::Results { .. } => "enter new text  ·  esc retry  ·  s stats",
-            Screen::Stats(_) => "",
+            Screen::Stats(_) | Screen::Profiles(_) => "",
         };
         let learning = if self.training { "  ·  learning" } else { "" };
 

@@ -13,25 +13,52 @@ use std::path::Path;
 pub const VOCAB: usize = 96;
 const EMB: usize = 16;
 const DENSE: usize = 6;
-const IN: usize = 3 * EMB + DENSE;
 const HIDDEN: usize = 64;
 const OUT: usize = 2;
-
+/// The most chars of context a model can see: the char itself and up to 11 before it.
+pub const MAX_CTX: usize = 12;
+/// The standard model: the char and the two before it.
+pub const DEFAULT_CTX: usize = 3;
+/// Context lengths a profile can be created with.
+pub const CONTEXTS: [usize; 4] = [3, 5, 8, 12];
+const MAX_IN: usize = MAX_CTX * EMB + DENSE;
 const O_EMB: usize = 0;
-const O_W1: usize = O_EMB + VOCAB * EMB;
-const O_B1: usize = O_W1 + IN * HIDDEN;
-const O_W2: usize = O_B1 + HIDDEN;
-const O_B2: usize = O_W2 + HIDDEN * HIDDEN;
-const O_W3: usize = O_B2 + HIDDEN;
-const O_B3: usize = O_W3 + HIDDEN * OUT;
-const N_PARAMS: usize = O_B3 + OUT;
+
+/// Where each weight block sits in `params`, for a model seeing `ctx` chars. The embedding
+/// table is shared by every context position.
+#[derive(Clone, Copy, Debug)]
+struct Layout {
+    ctx: usize,
+    inp: usize,
+    w1: usize,
+    b1: usize,
+    w2: usize,
+    b2: usize,
+    w3: usize,
+    b3: usize,
+    n: usize,
+}
+
+impl Layout {
+    fn new(ctx: usize) -> Layout {
+        let inp = ctx * EMB + DENSE;
+        let w1 = O_EMB + VOCAB * EMB;
+        let b1 = w1 + inp * HIDDEN;
+        let w2 = b1 + HIDDEN;
+        let b2 = w2 + HIDDEN * HIDDEN;
+        let w3 = b2 + HIDDEN;
+        let b3 = w3 + HIDDEN * OUT;
+        Layout { ctx, inp, w1, b1, w2, b2, w3, b3, n: b3 + OUT }
+    }
+}
 
 const MAX_INTERVAL_MS: f64 = 1500.0;
 const RECENCY_HALF_LIFE: f64 = 40.0;
 const EXPLORE_MS: f32 = 80.0;
 const DEFAULT_ERROR_MS: f32 = 600.0;
-/// v3 has v2's layout; v2 files were calibrated on all runs and get recalibrated.
-const MAGIC: &[u8] = b"SSPH\x03";
+/// v4 adds the context length; v3 has v2's layout (context 3); v2 files were calibrated on
+/// all runs and get recalibrated.
+const MAGIC: &[u8] = b"SSPH\x04";
 const MIN_CALIBRATION_RUNS: usize = 8;
 /// Shorter than training's: the exchange rate should follow how you type now.
 const CALIBRATION_HALF_LIFE: f64 = 10.0;
@@ -44,11 +71,13 @@ pub fn token(c: char) -> usize {
     }
 }
 
-/// The model input for keystroke `idx` of `text`: the two chars before it, the char itself,
-/// whether it needs shift, and where it sits in its word.
+/// The model input for keystroke `idx` of `text`: the chars before it (as many as any model
+/// can use; each model reads the last few), the char itself, whether it needs shift, and
+/// where it sits in its word.
 #[derive(Clone, Copy, Debug)]
 pub struct Feat {
-    tokens: [usize; 3],
+    /// Oldest first; the last is the char itself. 0 before the start of the run.
+    tokens: [usize; MAX_CTX],
     dense: [f32; DENSE],
 }
 
@@ -65,7 +94,17 @@ impl Feat {
             2 + in_word.min(3)
         };
         dense[slot] = 1.0;
-        Feat { tokens: [before(2), before(1), token(c)], dense }
+        Feat { tokens: std::array::from_fn(|k| before(MAX_CTX - 1 - k)), dense }
+    }
+
+    /// Index of (previous char, char) in a model's `seen` table.
+    fn pair(&self) -> usize {
+        self.tokens[MAX_CTX - 2] * VOCAB + self.tokens[MAX_CTX - 1]
+    }
+
+    /// The last `ctx` tokens, oldest first.
+    fn last(&self, ctx: usize) -> &[usize] {
+        &self.tokens[MAX_CTX - ctx..]
     }
 }
 
@@ -105,10 +144,11 @@ pub struct Model {
     pub ms_scale: f32,
     /// Training samples seen per (previous char, char) pair, for the exploration bonus.
     seen: Vec<u32>,
+    lay: Layout,
 }
 
 struct Acts {
-    x: [f32; IN],
+    x: [f32; MAX_IN],
     z1: [f32; HIDDEN],
     a1: [f32; HIDDEN],
     z2: [f32; HIDDEN],
@@ -119,7 +159,7 @@ struct Acts {
 impl Acts {
     fn new() -> Acts {
         Acts {
-            x: [0.0; IN],
+            x: [0.0; MAX_IN],
             z1: [0.0; HIDDEN],
             a1: [0.0; HIDDEN],
             z2: [0.0; HIDDEN],
@@ -169,33 +209,45 @@ fn dense_backward(w: &[f32], gw: &mut [f32], gb: &mut [f32], x: &[f32], dz: &[f3
 }
 
 impl Model {
+    #[cfg(test)]
     pub fn new(seed: u64) -> Model {
+        Self::with_context(DEFAULT_CTX, seed)
+    }
+
+    /// A fresh model seeing `ctx` chars (clamped to 1..=MAX_CTX).
+    pub fn with_context(ctx: usize, seed: u64) -> Model {
+        let lay = Layout::new(ctx.clamp(1, MAX_CTX));
         let mut rng = StdRng::seed_from_u64(seed);
-        let mut params = vec![0.0; N_PARAMS];
+        let mut params = vec![0.0; lay.n];
         let mut init = |range: std::ops::Range<usize>, limit: f32| {
             params[range].iter_mut().for_each(|p| *p = rng.random_range(-limit..limit));
         };
         let xavier = |fan_in: usize, fan_out: usize| (6.0 / (fan_in + fan_out) as f32).sqrt();
-        init(O_EMB..O_W1, 0.1);
-        init(O_W1..O_B1, xavier(IN, HIDDEN));
-        init(O_W2..O_B2, xavier(HIDDEN, HIDDEN));
-        init(O_W3..O_B3, xavier(HIDDEN, OUT));
-        params[O_B3] = 150f32.ln();
-        params[O_B3 + 1] = (0.05f32 / 0.95).ln();
-        Model { params, error_ms: DEFAULT_ERROR_MS, ms_scale: 1.0, seen: vec![0; VOCAB * VOCAB] }
+        init(O_EMB..lay.w1, 0.1);
+        init(lay.w1..lay.b1, xavier(lay.inp, HIDDEN));
+        init(lay.w2..lay.b2, xavier(HIDDEN, HIDDEN));
+        init(lay.w3..lay.b3, xavier(HIDDEN, OUT));
+        params[lay.b3] = 150f32.ln();
+        params[lay.b3 + 1] = (0.05f32 / 0.95).ln();
+        Model { params, error_ms: DEFAULT_ERROR_MS, ms_scale: 1.0, seen: vec![0; VOCAB * VOCAB], lay }
+    }
+
+    /// How many chars of context this model sees, the char itself included.
+    pub fn context(&self) -> usize {
+        self.lay.ctx
     }
 
     fn forward(&self, f: &Feat, a: &mut Acts) {
-        let p = &self.params;
-        for (k, &t) in f.tokens.iter().enumerate() {
+        let (p, l) = (&self.params, self.lay);
+        for (k, &t) in f.last(l.ctx).iter().enumerate() {
             a.x[k * EMB..(k + 1) * EMB].copy_from_slice(&p[O_EMB + t * EMB..O_EMB + (t + 1) * EMB]);
         }
-        a.x[3 * EMB..].copy_from_slice(&f.dense);
-        dense_forward(&p[O_W1..O_B1], &p[O_B1..O_W2], &a.x, &mut a.z1);
+        a.x[l.ctx * EMB..l.inp].copy_from_slice(&f.dense);
+        dense_forward(&p[l.w1..l.b1], &p[l.b1..l.w2], &a.x[..l.inp], &mut a.z1);
         a.z1.iter().zip(a.a1.iter_mut()).for_each(|(z, a)| *a = silu(*z));
-        dense_forward(&p[O_W2..O_B2], &p[O_B2..O_W3], &a.a1, &mut a.z2);
+        dense_forward(&p[l.w2..l.b2], &p[l.b2..l.w3], &a.a1, &mut a.z2);
         a.z2.iter().zip(a.a2.iter_mut()).for_each(|(z, a)| *a = silu(*z));
-        dense_forward(&p[O_W3..O_B3], &p[O_B3..], &a.a2, &mut a.out);
+        dense_forward(&p[l.w3..l.b3], &p[l.b3..l.n], &a.a2, &mut a.out);
     }
 
     /// Predicted (interval ms, error probability) for one keystroke.
@@ -213,7 +265,7 @@ impl Model {
 
     /// Optimism bonus for transitions the model has little data on.
     pub fn bonus(&self, f: &Feat) -> f32 {
-        let n = self.seen[f.tokens[1] * VOCAB + f.tokens[2]];
+        let n = self.seen[f.pair()];
         EXPLORE_MS / (1.0 + n as f32).sqrt()
     }
 
@@ -234,23 +286,23 @@ impl Model {
     }
 
     fn backward(&self, f: &Feat, a: &Acts, d_out: [f32; OUT], g: &mut [f32]) {
-        let p = &self.params;
-        let (mut d_a2, mut d_a1, mut d_x) = ([0.0; HIDDEN], [0.0; HIDDEN], [0.0; IN]);
+        let (p, l) = (&self.params, self.lay);
+        let (mut d_a2, mut d_a1, mut d_x) = ([0.0; HIDDEN], [0.0; HIDDEN], [0.0; MAX_IN]);
         {
-            let (gw, gb) = g[O_W3..].split_at_mut(O_B3 - O_W3);
-            dense_backward(&p[O_W3..O_B3], gw, gb, &a.a2, &d_out, &mut d_a2);
+            let (gw, gb) = g[l.w3..l.n].split_at_mut(l.b3 - l.w3);
+            dense_backward(&p[l.w3..l.b3], gw, gb, &a.a2, &d_out, &mut d_a2);
         }
         let d_z2: [f32; HIDDEN] = std::array::from_fn(|j| d_a2[j] * silu_grad(a.z2[j]));
         {
-            let (gw, gb) = g[O_W2..O_W3].split_at_mut(O_B2 - O_W2);
-            dense_backward(&p[O_W2..O_B2], gw, gb, &a.a1, &d_z2, &mut d_a1);
+            let (gw, gb) = g[l.w2..l.w3].split_at_mut(l.b2 - l.w2);
+            dense_backward(&p[l.w2..l.b2], gw, gb, &a.a1, &d_z2, &mut d_a1);
         }
         let d_z1: [f32; HIDDEN] = std::array::from_fn(|j| d_a1[j] * silu_grad(a.z1[j]));
         {
-            let (gw, gb) = g[O_W1..O_W2].split_at_mut(O_B1 - O_W1);
-            dense_backward(&p[O_W1..O_B1], gw, gb, &a.x, &d_z1, &mut d_x);
+            let (gw, gb) = g[l.w1..l.w2].split_at_mut(l.b1 - l.w1);
+            dense_backward(&p[l.w1..l.b1], gw, gb, &a.x[..l.inp], &d_z1, &mut d_x[..l.inp]);
         }
-        for (k, &t) in f.tokens.iter().enumerate() {
+        for (k, &t) in f.last(l.ctx).iter().enumerate() {
             let row = &mut g[O_EMB + t * EMB..O_EMB + (t + 1) * EMB];
             row.iter_mut().zip(&d_x[k * EMB..(k + 1) * EMB]).for_each(|(g, d)| *g += d);
         }
@@ -286,12 +338,12 @@ impl Model {
         }
         self.seen.fill(0);
         for s in &samples {
-            self.seen[s.feat.tokens[1] * VOCAB + s.feat.tokens[2]] += 1;
+            self.seen[s.feat.pair()] += 1;
         }
 
         let mut rng = StdRng::seed_from_u64(seed);
-        let mut adam = Adam::new(N_PARAMS);
-        let mut grad = vec![0.0; N_PARAMS];
+        let mut adam = Adam::new(self.lay.n);
+        let mut grad = vec![0.0; self.lay.n];
         let mut acts = Acts::new();
         let mut last_loss = 0.0;
         for _ in 0..epochs {
@@ -368,6 +420,7 @@ impl Model {
 
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         let mut bytes = MAGIC.to_vec();
+        bytes.extend((self.lay.ctx as u32).to_le_bytes());
         bytes.extend(self.error_ms.to_le_bytes());
         bytes.extend(self.ms_scale.to_le_bytes());
         self.params.iter().for_each(|p| bytes.extend(p.to_le_bytes()));
@@ -381,22 +434,35 @@ impl Model {
     /// is wrong; callers recalibrate those with `calibrate_cost` and save them again.
     pub fn load_versioned(path: &Path) -> std::io::Result<(Model, bool)> {
         let bytes = std::fs::read(path)?;
-        let body = 4 * N_PARAMS + 4 * VOCAB * VOCAB;
-        let v2 = bytes.starts_with(b"SSPH\x02") && bytes.len() == 5 + 8 + body;
-        let current = bytes.starts_with(MAGIC) && bytes.len() == 5 + 8 + body;
-        let old = bytes.starts_with(b"SSPH\x01") && bytes.len() == 5 + 4 + body;
-        if !current && !old && !v2 {
-            return Err(std::io::Error::other(format!("{} is not a model file", path.display())));
-        }
+        let not_a_model = || std::io::Error::other(format!("{} is not a model file", path.display()));
         let f32_at = |i: usize| f32::from_le_bytes(bytes[i..i + 4].try_into().unwrap());
+        let body = |lay: Layout| 4 * lay.n + 4 * VOCAB * VOCAB;
+        // (layout, offset of error_ms, of ms_scale if stored, of the params, calibration current)
+        let three = Layout::new(DEFAULT_CTX);
+        let (lay, err_at, scale_at, start, current) = match bytes.get(..5) {
+            Some(m) if m == MAGIC && bytes.len() >= 9 => {
+                let ctx = u32::from_le_bytes(bytes[5..9].try_into().unwrap()) as usize;
+                if !(1..=MAX_CTX).contains(&ctx) {
+                    return Err(not_a_model());
+                }
+                (Layout::new(ctx), 9, Some(13), 17, true)
+            }
+            Some(b"SSPH\x03") => (three, 5, Some(9), 13, true),
+            Some(b"SSPH\x02") => (three, 5, Some(9), 13, false),
+            Some(b"SSPH\x01") => (three, 5, None, 9, false),
+            _ => return Err(not_a_model()),
+        };
+        if bytes.len() != start + body(lay) {
+            return Err(not_a_model());
+        }
         let words = |b: &[u8]| -> Vec<[u8; 4]> { b.chunks_exact(4).map(|c| c.try_into().unwrap()).collect() };
-        let start = if old { 9 } else { 13 };
-        let (params, seen) = bytes[start..].split_at(4 * N_PARAMS);
+        let (params, seen) = bytes[start..].split_at(4 * lay.n);
         let model = Model {
             params: words(params).into_iter().map(f32::from_le_bytes).collect(),
-            error_ms: f32_at(5),
-            ms_scale: if old { 1.0 } else { f32_at(9) },
+            error_ms: f32_at(err_at),
+            ms_scale: scale_at.map_or(1.0, f32_at),
             seen: words(seen).into_iter().map(u32::from_le_bytes).collect(),
+            lay,
         };
         let finite = model.error_ms.is_finite() && model.ms_scale.is_finite();
         if !finite || !model.params.iter().all(|p| p.is_finite()) {
@@ -512,11 +578,12 @@ mod tests {
     fn features_encode_context_shift_and_position() {
         let text = chars("ab Cd");
         let f = Feat::at(&text, 3);
-        assert_eq!(f.tokens, [token('b'), token(' '), token('c')]);
+        assert_eq!(f.tokens[MAX_CTX - 3..], [token('b'), token(' '), token('c')]);
+        assert_eq!(f.tokens[..MAX_CTX - 4], [0; MAX_CTX - 4], "nothing before the start");
         assert_eq!(f.dense[0], 1.0, "capital needs shift");
         assert_eq!(f.dense[2], 1.0, "first char of a word");
         assert_eq!(Feat::at(&text, 2).dense[1], 1.0, "space slot");
-        assert_eq!(Feat::at(&text, 0).tokens[..2], [0, 0]);
+        assert_eq!(Feat::at(&text, 0).tokens[..MAX_CTX - 1], [0; MAX_CTX - 1]);
     }
 
     #[test]
@@ -524,16 +591,17 @@ mod tests {
         let text = chars("the cat");
         let mut model = Model::new(3);
         let sample = Sample { feat: Feat::at(&text, 5), log_ms: Some(4.8), error: true, weight: 0.7 };
-        let mut grad = vec![0.0; N_PARAMS];
+        let l = model.lay;
+        let mut grad = vec![0.0; l.n];
         let mut acts = Acts::new();
         model.sample_grad(&sample, &mut acts, &mut grad);
-        let probes = [O_EMB + token('a') * EMB + 2, O_W1 + 17, O_B1 + 5, O_W2 + 300, O_W3 + 7, O_B3, O_B3 + 1];
+        let probes = [O_EMB + token('a') * EMB + 2, l.w1 + 17, l.b1 + 5, l.w2 + 300, l.w3 + 7, l.b3, l.b3 + 1];
         for i in probes {
             let h = 1e-2;
             let orig = model.params[i];
             let mut loss_at = |v: f32| {
                 model.params[i] = v;
-                model.sample_grad(&sample, &mut Acts::new(), &mut vec![0.0; N_PARAMS])
+                model.sample_grad(&sample, &mut Acts::new(), &mut vec![0.0; l.n])
             };
             let numeric = (loss_at(orig + h) - loss_at(orig - h)) / (2.0 * h);
             model.params[i] = orig;
@@ -632,6 +700,77 @@ mod tests {
 
     #[test]
     fn old_model_files_load_as_uncalibrated() {
+        // v3 (context 3, current calibration) still loads as current.
+        let dir = std::env::temp_dir().join(format!("thehill-v3-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("v3.bin");
+        let model = Model::new(1);
+        model.save(&path).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[4] = 3;
+        bytes.drain(5..9);
+        std::fs::write(&path, bytes).unwrap();
+        let (v3, current) = Model::load_versioned(&path).unwrap();
+        assert!(current && v3.context() == 3 && v3.params == model.params);
+        std::fs::remove_dir_all(dir).unwrap();
+        old_v1_files_load_as_uncalibrated();
+    }
+
+    #[test]
+    fn longer_context_models_learn_save_and_backprop_correctly() {
+        let mut model = Model::with_context(8, 5);
+        // Gradient check through all eight context slots.
+        let text = chars("over the lazy dog");
+        let sample = Sample { feat: Feat::at(&text, 12), log_ms: Some(5.1), error: false, weight: 1.0 };
+        let l = model.lay;
+        let mut grad = vec![0.0; l.n];
+        model.sample_grad(&sample, &mut Acts::new(), &mut grad);
+        // An input weight fed by the oldest context slot ("t", 7 chars back) and one by the newest.
+        for i in [l.w1 + 2 * HIDDEN + 3, l.w1 + (7 * EMB + 1) * HIDDEN + 5, O_EMB + token('h') * EMB] {
+            let orig = model.params[i];
+            let mut loss_at = |v: f32| {
+                model.params[i] = v;
+                model.sample_grad(&sample, &mut Acts::new(), &mut vec![0.0; l.n])
+            };
+            let numeric = (loss_at(orig + 1e-2) - loss_at(orig - 1e-2)) / 2e-2;
+            model.params[i] = orig;
+            assert!((numeric - grad[i]).abs() < 2e-3 + 2e-2 * numeric.abs(), "param {i}: {numeric} vs {}", grad[i]);
+        }
+        // Something only a long context can see: "q" is slow only six chars after an "x".
+        let text = chars("xabcdeq yabcdeq xabcdeq yabcdeq");
+        let mut events = Vec::new();
+        let mut t = 0.0;
+        for rep in 0..40 {
+            for (i, &c) in text.iter().enumerate() {
+                t += if c == 'q' && text[i - 6] == 'x' { 600.0 } else { 100.0 };
+                events.push((rep, Event { t, idx: i, expected: Some(c), key: Key::Char(c), correct: true }));
+            }
+        }
+        let runs: Vec<RunLog> = (0..40)
+            .map(|rep| RunLog {
+                text: text.clone(),
+                events: events.iter().filter(|e| e.0 == rep).map(|e| e.1.clone()).collect(),
+                wpm: 60.0,
+                hill: true,
+            })
+            .collect();
+        let mut short = Model::with_context(3, 5);
+        model.fit(&runs, 30, 1);
+        short.fit(&runs, 30, 1);
+        let gap = |m: &Model| m.predict(&Feat::at(&text, 6)).0 / m.predict(&Feat::at(&text, 14)).0;
+        assert!(gap(&model) > 3.0, "long context tells x-q from y-q: {}", gap(&model));
+        assert!(gap(&short) < 1.5, "three chars can't: {}", gap(&short));
+
+        let dir = std::env::temp_dir().join(format!("thehill-ctx-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("long.bin");
+        model.save(&path).unwrap();
+        let (loaded, current) = Model::load_versioned(&path).unwrap();
+        assert!(current && loaded.context() == 8 && loaded.params == model.params);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn old_v1_files_load_as_uncalibrated() {
         let dir = std::env::temp_dir().join(format!("thehill-v1-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("old.bin");

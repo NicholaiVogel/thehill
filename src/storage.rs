@@ -144,6 +144,15 @@ fn key_from(code: &str) -> Key {
 }
 
 impl Store {
+    /// Opens an existing profile's database without creating anything: for work that must
+    /// not bring back a profile that was deleted meanwhile.
+    pub fn open_existing(dir: &Path) -> Result<Store> {
+        if !dir.join("thehill.db").is_file() {
+            anyhow::bail!("{} has no database", dir.display());
+        }
+        Self::open(dir)
+    }
+
     pub fn open(dir: &Path) -> Result<Store> {
         std::fs::create_dir_all(dir.join("checkpoints"))?;
         let conn = Connection::open(dir.join("thehill.db"))?;

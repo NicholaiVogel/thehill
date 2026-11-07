@@ -35,6 +35,7 @@ The text font is JetBrains Mono if it's installed, then DejaVu Sans Mono or Menl
 - The results screen graphs your wpm through the run against the hill's committed pace (dashed) and the ghost, marks your mistakes, and names the word you lost the most time on.
 - Boss runs: every 10th run against the live hill is 25 words built from its worst trigrams (four, or more if too few words hold them). It guards the checkpoint that follows; new text or a retry doesn't skip it. Bosses keep their own record.
 - Ghost (`ctrl+g`): a faint second caret typing the same text at the pace of the checkpoint frozen about 50 runs ago, i.e. you back then. Its score shows as "past you".
+- Profiles (`ctrl+p`, or click the profile name in the top bar): each has its own runs, model and checkpoints. `n` starts a new one from scratch and asks how many chars of context its model reads (3, 5, 8 or 12; the standard model reads 3). `r` renames, `d` twice deletes (moved to `trash/` in the data folder, so it can be recovered). The original data is the main profile and can't be deleted.
 - The hill sometimes brings up a word from this run that you also typed at least 20 runs ago, when your time per letter on it has changed by 15% or more.
 - `ctrl+s` (or `s` on the results screen) opens the slope: every checkpoint, plotted by how fast it thinks you type. Pick one with the arrow keys and `enter` to play against it. Its text targets the weaknesses you had back then, and the results show how far past its prediction you've moved.
 
@@ -59,7 +60,7 @@ The first 3 runs use plain common words while the model gets its first data.
 
 ## Data
 
-`~/.local/share/thehill` on Linux, `~/Library/Application Support/thehill` on macOS. Data from the earlier name (Sisyphus) is copied over on first launch. Override with `THEHILL_DATA_DIR`.
+`~/.local/share/thehill` on Linux, `~/Library/Application Support/thehill` on macOS. Other profiles live in `profiles/` inside it. Data from the earlier name (Sisyphus) is copied over on first launch. Override with `THEHILL_DATA_DIR`.
 
 - `thehill.db`: runs, keystrokes, checkpoints, settings
 - `live.bin`: current model

@@ -69,7 +69,7 @@ pub fn after_run(store: &Store, mut model: Model) -> Result<(Model, bool)> {
 
 /// Rebuilds the live model from scratch from the whole log.
 pub fn retrain(store: &Store) -> Result<Model> {
-    let mut model = Model::new(0);
+    let mut model = Model::with_context(crate::profiles::context(store), 0);
     let loss = model.fit(&store.recent_runs(usize::MAX)?, RETRAIN_EPOCHS, 0);
     println!("retrained on {} runs, final loss {loss:.4}", store.run_count()?);
     model.save(&store.live_model_path())?;
@@ -96,8 +96,7 @@ fn common_trigrams() -> &'static [[char; 3]] {
 /// The common trigrams whose last keystroke the model expects to cost the most,
 /// written with `_` for a space.
 pub fn weaknesses(model: &Model, n: usize) -> Vec<String> {
-    let mut scored: Vec<(f32, &[char; 3])> =
-        common_trigrams().iter().map(|t| (model.cost(&Feat::at(t, 2)), t)).collect();
+    let mut scored: Vec<(f32, &[char; 3])> = common_trigrams().iter().map(|t| (trigram_cost(model, t), t)).collect();
     scored.sort_by(|a, b| b.0.total_cmp(&a.0));
     scored.iter().take(n).map(|(_, t)| t.iter().map(|&c| if c == ' ' { '_' } else { c }).collect()).collect()
 }
@@ -105,7 +104,59 @@ pub fn weaknesses(model: &Model, n: usize) -> Vec<String> {
 /// Expected cost of a weakness tag's last keystroke (tags use `_` for a space).
 fn tag_cost(model: &Model, tag: &str) -> f32 {
     let chars: Vec<char> = tag.chars().map(|c| if c == '_' { ' ' } else { c }).collect();
-    model.cost(&Feat::at(&chars, chars.len() - 1))
+    trigram_cost(model, &chars)
+}
+
+/// Where the trigram's own chars aren't all a model reads: up to this many places it occurs
+/// in everyday text.
+const TRIGRAM_PLACES: usize = 4;
+
+/// Expected cost of a trigram's last keystroke. A 3-char model reads just the trigram. A
+/// longer one would read the empty space before it as the start of a run, so it's scored
+/// where the trigram really occurs in everyday text, or after everyday words if it doesn't.
+fn trigram_cost(model: &Model, t: &[char]) -> f32 {
+    if model.context() <= t.len() {
+        return model.cost(&Feat::at(t, t.len() - 1));
+    }
+    let key: Vec<char> = t.to_vec();
+    match trigram_places().get(&key) {
+        Some(places) => {
+            let text = everyday_text();
+            places.iter().map(|&i| model.cost(&Feat::at(text, i))).sum::<f32>() / places.len() as f32
+        }
+        None => {
+            let lead = if t[0] == ' ' { "and of the" } else { "and of the " };
+            let text: Vec<char> = lead.chars().chain(t.iter().copied()).collect();
+            model.cost(&Feat::at(&text, text.len() - 1))
+        }
+    }
+}
+
+/// The 2,000 most common words in a fixed shuffled order.
+fn everyday_text() -> &'static [char] {
+    static TEXT: OnceLock<Vec<char>> = OnceLock::new();
+    TEXT.get_or_init(|| {
+        let mut top: Vec<&str> = words()[..2000.min(words().len())].to_vec();
+        top.shuffle(&mut StdRng::seed_from_u64(11));
+        top.join(" ").chars().collect()
+    })
+}
+
+/// For each trigram in `everyday_text`, where its last char sits (well into the text, so a
+/// 12-char model has real text behind it).
+fn trigram_places() -> &'static HashMap<Vec<char>, Vec<usize>> {
+    static PLACES: OnceLock<HashMap<Vec<char>, Vec<usize>>> = OnceLock::new();
+    PLACES.get_or_init(|| {
+        let text = everyday_text();
+        let mut places: HashMap<Vec<char>, Vec<usize>> = HashMap::new();
+        for i in crate::model::MAX_CTX..text.len() {
+            let found = places.entry(text[i - 2..=i].to_vec()).or_default();
+            if found.len() < TRIGRAM_PLACES {
+                found.push(i);
+            }
+        }
+        places
+    })
 }
 
 /// Earlier weaknesses that left the current top list *and* got cheaper since, i.e. that
@@ -162,7 +213,7 @@ pub fn key_costs(model: &Model) -> Vec<(char, Option<f32>)> {
         .map(|key| {
             let contexts = key_contexts().get(&key).map_or(&[][..], |v| v.as_slice());
             let total: f64 = contexts.iter().map(|(_, w)| w).sum();
-            let cost: f64 = contexts.iter().map(|(t, w)| model.cost(&Feat::at(t, 2)) as f64 * w).sum();
+            let cost: f64 = contexts.iter().map(|(t, w)| trigram_cost(model, t) as f64 * w).sum();
             let known = total > 0.0 && model.samples_for(key) >= MIN_KEY_SAMPLES;
             (key, known.then_some((cost / total) as f32))
         })

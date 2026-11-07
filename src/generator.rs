@@ -5,7 +5,7 @@
 //! tricks: a word family (yeet, yeeting) appears at most once per run, and words from
 //! recent runs, with their families, are rested before they come back.
 
-use crate::model::{Feat, Model};
+use crate::model::{Feat, MAX_CTX, Model};
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, OnceLock};
@@ -87,6 +87,10 @@ pub struct WordCosts {
     shortlist: Vec<usize>,
 }
 
+/// What a word is scored after when the real text before it isn't known: everyday words, so a
+/// long-context model doesn't read it as the start of a run. A 3-char model sees only "e ".
+const LEAD: &str = "and of the";
+
 /// Chars for `word` typed after `prev` and followed by a space.
 fn in_context(prev: &str, word: &str) -> Vec<char> {
     format!("{prev} {word} ").chars().collect()
@@ -97,8 +101,8 @@ impl WordCosts {
         let per_word: Vec<(Vec<f32>, f32)> = words()
             .iter()
             .map(|w| {
-                let text = in_context("the", w);
-                let feats: Vec<Feat> = (4..text.len()).map(|i| Feat::at(&text, i)).collect();
+                let text = in_context(LEAD, w);
+                let feats: Vec<Feat> = (LEAD.len() + 1..text.len()).map(|i| Feat::at(&text, i)).collect();
                 let bonus = feats.iter().map(|f| model.bonus(f)).sum::<f32>() / feats.len() as f32;
                 (feats.iter().map(|f| model.cost(f)).collect(), bonus)
             })
@@ -224,7 +228,10 @@ impl Generator {
             self.recent.pop_front();
         }
         let word = self.decorate(words()[pick]);
-        self.prev.clone_from(&word);
+        // The text so far, as much as any model reads before a word's first char.
+        let joined = if self.prev.is_empty() { word.clone() } else { format!("{} {word}", self.prev) };
+        let skip = joined.chars().count().saturating_sub(MAX_CTX - 2);
+        self.prev = joined.chars().skip(skip).collect();
         self.emitted.push_back(word.clone());
         if self.emitted.len() > NO_REPEAT {
             self.emitted.pop_front();
@@ -248,11 +255,11 @@ impl Generator {
             return self.sample(&all, &scores);
         }
         // Targeted: rescore the shortlist with the real transition out of the previous word.
-        let prev_tail: String = self.prev.chars().rev().take(2).collect::<Vec<_>>().into_iter().rev().collect();
+        let prev_tail = &self.prev;
         let score = |i: usize| {
             let w = words()[i];
-            let text = in_context(&prev_tail, w);
-            let first = model.cost(&Feat::at(&text, prev_tail.len() + 1)) - costs.first_base;
+            let text = in_context(prev_tail, w);
+            let first = model.cost(&Feat::at(&text, prev_tail.chars().count() + 1)) - costs.first_base;
             (first + costs.rest[i]) / (w.len() + 1) as f32
         };
         let (candidates, scores): (Vec<usize>, Vec<f64>) = match &self.boss {

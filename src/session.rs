@@ -472,7 +472,7 @@ impl Session {
 
     /// The live model to continue training from.
     pub fn training_base(&self) -> Model {
-        self.live.clone().unwrap_or_else(|| Model::new(0))
+        self.live.clone().unwrap_or_else(|| Model::with_context(crate::profiles::context(&self.store), 0))
     }
 
     /// Installs a newly trained live model; if playing against live, it becomes the opponent.
@@ -501,7 +501,7 @@ impl Session {
 /// Trains on the log (opening its own connection so it can run on any thread) and prepares
 /// word costs for the new model. Also returns the hill's announcement if a checkpoint was frozen.
 pub fn train(dir: &Path, base: Model) -> Result<(Model, WordCosts, Option<String>)> {
-    let store = Store::open(dir)?;
+    let store = Store::open_existing(dir)?;
     let (model, froze) = learn::after_run(&store, base)?;
     let announcement = if froze {
         let all = store.checkpoints()?;
@@ -722,8 +722,10 @@ mod tests {
             .store
             .add_checkpoint(0, &[], 1.0, |path| {
                 Model::new(1).save(path)?;
+                // v2: the same as v4 without the context length.
                 let mut bytes = std::fs::read(path)?;
                 bytes[4] = 2;
+                bytes.drain(5..9);
                 std::fs::write(path, bytes)
             })
             .unwrap();

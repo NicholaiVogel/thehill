@@ -1,6 +1,7 @@
 mod generator;
 mod learn;
 mod model;
+mod profiles;
 mod session;
 mod sim;
 mod storage;
@@ -9,7 +10,6 @@ mod ui;
 mod voice;
 
 use anyhow::{Context, Result, bail};
-use std::path::PathBuf;
 
 const USAGE: &str = "usage: thehill [--simulate N [--slow th,er]] [--retrain] [--stats] [--calibrate [N]]";
 
@@ -17,7 +17,7 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let flag = |name: &str| args.iter().position(|a| a == name).map(|i| args.get(i + 1));
     storage::adopt_legacy_data().context("could not copy data over from Sisyphus")?;
-    let dir = storage::data_dir();
+    let dir = profiles::dir_of(&profiles::active());
 
     if let Some(n) = flag("--simulate") {
         let n: usize = n.context(USAGE)?.parse().context("--simulate takes a run count")?;
@@ -25,9 +25,9 @@ fn main() -> Result<()> {
             Some(list) => list.context(USAGE)?.split(',').map(String::from).collect(),
             None => vec!["th".into(), "er".into()],
         };
-        // Never mix synthetic runs into real data unless asked to.
+        // Never mix synthetic runs into real data unless asked to (then into the active profile).
         let dir = match std::env::var_os("THEHILL_DATA_DIR") {
-            Some(d) => PathBuf::from(d),
+            Some(_) => dir,
             None => std::env::temp_dir().join(format!("thehill-sim-{}", std::process::id())),
         };
         println!("simulating {n} runs in {}", dir.display());
@@ -89,6 +89,7 @@ fn stats(dir: &std::path::Path) -> Result<()> {
         println!("checkpoint {}: {}  (reference {:.0} wpm)", c.id, c.label(), c.reference_wpm);
     }
     if let Some(model) = learn::load_live(&store) {
+        println!("context: {} chars", model.context());
         println!("live model reference: {:.0} wpm", learn::reference_wpm(&model));
         println!("weakest transitions: {}", learn::weaknesses(&model, 10).join("  "));
         let costs = generator::WordCosts::new(&model);
