@@ -191,6 +191,26 @@ impl Generator {
         self
     }
 
+    /// Turns this into a boss built from words `hits` scores above zero, likelier the higher
+    /// it scores them. Leaves it unchanged and returns false if too few words qualify for the
+    /// family and rest rules to leave a real choice.
+    pub fn boss_by(&mut self, hits: impl Fn(&str) -> usize) -> bool {
+        let (mut candidates, mut bonus) = (Vec::new(), Vec::new());
+        for (i, w) in words().iter().enumerate() {
+            let n = if w.len() >= 3 { hits(w) } else { 0 };
+            if n > 0 {
+                candidates.push(i);
+                bonus.push(BOSS_HIT_MS * n as f32 / (w.len() + 1) as f32);
+            }
+        }
+        if candidates.len() < BOSS_MIN_WORDS {
+            return false;
+        }
+        self.boss = Some((candidates, bonus));
+        self.boss_targets.clear();
+        true
+    }
+
     /// The trigrams a boss run is built from; empty for an ordinary run.
     pub fn boss_targets(&self) -> &[String] {
         &self.boss_targets
@@ -432,6 +452,24 @@ mod tests {
                 assert!(!window.contains(w), "{w} repeated at {i}");
             }
         }
+    }
+
+    #[test]
+    fn themed_bosses_stick_to_their_theme() {
+        let left = |w: &str| {
+            let side = w.chars().filter(|&c| crate::hands::finger(c).is_some_and(|f| f.left())).count();
+            if w.len() >= 4 && side * 10 >= w.len() * 8 { side } else { 0 }
+        };
+        let mut g = Generator::new(Some(trained()), Options { punctuation: false, numbers: true }, &[], 9);
+        assert!(g.boss_by(left));
+        for w in g.take(25) {
+            assert!(left(&w) > 0, "{w} is not a left-hand word");
+        }
+        let mut g = Generator::new(Some(trained()), Options { punctuation: false, numbers: false }, &[], 9);
+        assert!(g.boss_by(crate::hands::same_finger_pairs));
+        assert!(g.take(25).iter().all(|w| crate::hands::same_finger_pairs(w) > 0));
+        let mut g = Generator::new(Some(trained()), Options { punctuation: false, numbers: false }, &[], 9);
+        assert!(!g.boss_by(|w| usize::from(w == "zyzzyva")), "too few words: no boss");
     }
 
     #[test]

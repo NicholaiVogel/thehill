@@ -2,6 +2,7 @@
 //! generating a run, scoring it, logging it, and learning from it.
 
 use crate::generator::{Generator, Options, REST_WORDS, WordCosts, typed_words};
+use crate::hands;
 use crate::learn::{self, COLD_RUNS};
 use crate::model::{Model, wpm_from_costs};
 use crate::storage::{RunRecord, Store};
@@ -45,6 +46,10 @@ pub type Opponent = (Arc<Model>, Arc<WordCosts>);
 
 /// Boss runs: every `CHECKPOINT_EVERY`th run against the live hill, this many words long.
 pub const BOSS_WORDS: u32 = 25;
+/// Bosses take turns: worst trigrams, slowest finger, same finger twice, slower hand.
+const BOSS_THEMES: i64 = 4;
+/// Runs the finger and hand bosses look back over.
+const HANDS_RUNS: usize = 100;
 /// The hill picks the words it thinks are slowest for you, and some of those it has simply
 /// overrated, so on its own text it predicts low. Its committed predictions are corrected by
 /// how far off they've been lately: a weighted mean of log(actual / predicted) over this many
@@ -138,6 +143,7 @@ pub struct Finished {
     pub struggling: Vec<String>,
     pub improved: Vec<String>,
     pub graph: Graph,
+    pub hands: Option<hands::RunHands>,
     /// The ghost's label and the wpm it would have scored.
     pub ghost: Option<(String, f64)>,
     pub boss: bool,
@@ -236,10 +242,14 @@ impl Session {
         let mode = if boss { Mode::Words(BOSS_WORDS) } else { self.mode };
         let rest: &[String] = if opponent.is_some() { &self.resting } else { &[] };
         let mut generator = Generator::new(opponent.clone(), self.options, rest, self.seed);
+        let mut themed = None;
         let mut targets = Vec::new();
         if let (true, Some((m, _))) = (boss, &opponent) {
-            generator = generator.boss(&learn::weaknesses(m, 12));
-            targets = generator.boss_targets().to_vec();
+            themed = self.boss_theme(runs, &mut generator)?;
+            if themed.is_none() {
+                generator = generator.boss(&learn::weaknesses(m, 12));
+                targets = generator.boss_targets().to_vec();
+            }
         }
         let test = Test::new(generator.take(mode.initial_words()));
         let weak = opponent.as_ref().map(|(m, _)| learn::weaknesses(m, 6)).unwrap_or_default();
@@ -248,7 +258,7 @@ impl Session {
             None if runs < COLD_RUNS => self.voice.cold_preview(COLD_RUNS - runs),
             // Enough runs but no usable model (deleted or corrupt): nothing honest to say yet.
             None => String::new(),
-            Some(_) if boss => self.voice.boss_preview(&targets),
+            Some(_) if boss => themed.unwrap_or_else(|| self.voice.boss_preview(&targets)),
             Some((model, _)) => self.preview(model, &test, &weak),
         };
         self.save_voice();
@@ -293,6 +303,46 @@ impl Session {
     /// How much faster than the model's own prediction you've been typing its text lately.
     fn correction(&self) -> Result<f64> {
         Ok(correction(&self.store.model_results(CORRECTION_RUNS)?))
+    }
+
+    /// Makes `generator` this turn's themed boss and returns the hill's intro; `None` when
+    /// it's the trigram boss's turn or there isn't the data for the theme.
+    fn boss_theme(&mut self, runs: i64, generator: &mut Generator) -> Result<Option<String>> {
+        let turn = (runs + 1) / learn::CHECKPOINT_EVERY % BOSS_THEMES;
+        if turn == 0 {
+            return Ok(None);
+        }
+        let h = hands::of_runs(&self.store.recent_runs(HANDS_RUNS)?);
+        let line = match turn {
+            1 => h
+                .slowest()
+                .filter(|&(f, _)| {
+                    generator.boss_by(|w| {
+                        let n = w.chars().filter(|&c| hands::finger(c) == Some(f)).count();
+                        if n >= 2 { n } else { 0 }
+                    })
+                })
+                .map(|(f, ms)| self.voice.boss_finger(f.name(), ms)),
+            2 => h
+                .same_finger
+                .filter(|_| generator.boss_by(hands::same_finger_pairs))
+                .map(|(same, other, _)| self.voice.boss_same_finger(same - other)),
+            _ => match (h.hands[0].ms, h.hands[1].ms) {
+                (Some(l), Some(r)) => {
+                    let left = l >= r;
+                    generator
+                        .boss_by(|w| {
+                            let letters = w.chars().filter(|c| hands::finger(*c).is_some()).count();
+                            let side =
+                                w.chars().filter(|&c| hands::finger(c).is_some_and(|f| f.left() == left)).count();
+                            if w.len() >= 4 && side * 10 >= letters * 8 { side } else { 0 }
+                        })
+                        .then(|| self.voice.boss_hand(if left { "left" } else { "right" }, l.max(r), l.min(r)))
+                }
+                _ => None,
+            },
+        };
+        Ok(line)
     }
 
     /// The checkpoint frozen about `GHOST_RUNS_BACK` runs ago, or the oldest one if there
@@ -369,6 +419,8 @@ impl Session {
             Some(id) => self.store.checkpoints()?.into_iter().find(|c| c.id == id).map(|c| c.date()),
             None => None,
         };
+        let typed: Vec<char> = run.test.text().chars().collect();
+        let run_hands = hands::of_run(&typed, &run.test.events);
         let facts = RunFacts {
             wpm: score.wpm,
             raw: score.raw,
@@ -382,11 +434,13 @@ impl Session {
             personal_best: !run.boss && best_before.is_some_and(|b| score.wpm > b),
             boss: run.boss,
             memory: if run.hill { self.memory(&run.test, run_id)? } else { None },
+            hands: run_hands.clone(),
             streak: if predicted > 0.0 { streak(&self.store.recent_results(usize::MAX)?) } else { 0 },
             slowest: slowest.first().copied(),
             worst_word: worst_word(&run.test),
         };
         let lines = if run.hill { self.voice.results(&facts) } else { Vec::new() };
+        let hands = run_hands;
         self.save_voice();
         let (struggling, improved) = match &self.live {
             Some(live) => {
@@ -421,6 +475,7 @@ impl Session {
             graph,
             ghost,
             boss: run.boss,
+            hands,
         })
     }
 
@@ -558,11 +613,14 @@ fn clean_intervals(events: &[Event]) -> impl Iterator<Item = (&Event, f64)> {
     })
 }
 
+/// Longer than this between two keys is a stop, not a slow transition (the model's rule too).
+const PAUSE_MS: f64 = 1500.0;
+
 /// The slowest clean transitions in a run, one per char pair.
 fn slowest(test: &Test, n: usize) -> Vec<(char, char, f64)> {
     let text: Vec<char> = test.text().chars().collect();
     let mut best: Vec<(char, char, f64)> = Vec::new();
-    for (e, ms) in clean_intervals(&test.events) {
+    for (e, ms) in clean_intervals(&test.events).filter(|&(_, ms)| ms <= PAUSE_MS) {
         let (a, b) = (text[e.idx - 1], text[e.idx]);
         match best.iter_mut().find(|(x, y, _)| (*x, *y) == (a, b)) {
             Some(entry) => entry.2 = entry.2.max(ms),

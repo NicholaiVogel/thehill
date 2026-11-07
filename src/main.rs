@@ -1,4 +1,5 @@
 mod generator;
+mod hands;
 mod learn;
 mod model;
 mod profiles;
@@ -11,7 +12,8 @@ mod voice;
 
 use anyhow::{Context, Result, bail};
 
-const USAGE: &str = "usage: thehill [--simulate N [--slow th,er]] [--retrain] [--stats] [--calibrate [N]]";
+const USAGE: &str =
+    "usage: thehill [--simulate N [--slow th,er]] [--retrain] [--stats] [--calibrate [N]] [--hands [N]]";
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -41,6 +43,10 @@ fn main() -> Result<()> {
     if let Some(n) = flag("--calibrate") {
         let n = n.map_or(Ok(20), |n| n.parse()).context("--calibrate takes a run count")?;
         return calibrate(&dir, n);
+    }
+    if let Some(n) = flag("--hands") {
+        let n = n.map_or(Ok(usize::MAX), |n| n.parse()).context("--hands takes a run count")?;
+        return print_hands(&dir, n);
     }
     if args.iter().any(|a| a == "--stats") {
         return stats(&dir);
@@ -77,6 +83,43 @@ fn calibrate(dir: &std::path::Path, n: usize) -> Result<()> {
             run.wpm,
             if run.hill { "hill" } else { "" }
         );
+    }
+    Ok(())
+}
+
+fn print_hands(dir: &std::path::Path, n: usize) -> Result<()> {
+    let runs = storage::Store::open(dir)?.recent_runs(n)?;
+    let h = hands::of_runs(&runs);
+    println!("{} runs", runs.len());
+    let ms = |v: Option<f64>| v.map_or("-".into(), |v| format!("{v:.0}ms"));
+    let pct = |v: Option<f64>| v.map_or("-".into(), |v| format!("{:.1}%", v * 100.0));
+    for (side, name) in ["left", "right"].iter().enumerate() {
+        let s = h.hands[side];
+        println!(
+            "{name:6} {:>6} {:>6}  {:.0}% of letters, {:.0}% of the time",
+            ms(s.ms),
+            pct(s.error_rate),
+            h.work[side] * 100.0,
+            h.time[side] * 100.0
+        );
+    }
+    for f in hands::FINGERS {
+        let s = h.fingers[f.index()];
+        println!("  {:13} {:>6} {:>6}  {} keys", f.name(), ms(s.ms), pct(s.error_rate), s.keys);
+    }
+    for (slip, share) in &h.slips {
+        println!("  {:24} {:.0}%", slip.name(), share * 100.0);
+    }
+    let mixups: Vec<String> = h.confusions.iter().map(|(a, b, n)| format!("{a}→{b} {n}")).collect();
+    println!("mix-ups: {}", mixups.join("  "));
+    if let Some((s, o, n)) = h.same_finger {
+        println!("same finger twice {s:.0}ms vs {o:.0}ms ({n} pairs)");
+    }
+    if let Some((l, r)) = h.switch {
+        println!("into left {l:.0}ms, into right {r:.0}ms");
+    }
+    if let Some((i, o)) = h.rolls {
+        println!("rolls inward {i:.0}ms, outward {o:.0}ms");
     }
     Ok(())
 }

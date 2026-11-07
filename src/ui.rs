@@ -1,5 +1,6 @@
 //! The window: config bar, typing area, results, the slope, and the hill's voice.
 
+use crate::hands::{self, Finger, Hands};
 use crate::learn::{self, CHECKPOINT_EVERY};
 use crate::model::{self, CONTEXTS, Model};
 use crate::profiles::{self, Profile};
@@ -130,6 +131,41 @@ struct Stats {
     selected: usize,
     tags: Vec<String>,
     heat: Vec<(char, Option<f32>)>,
+    /// Showing the hands page instead of the checkpoint slope; its numbers once loaded.
+    on_hands: bool,
+    hands: Option<Box<HandsView>>,
+}
+
+/// Runs the hands page looks at, and the size of each half of its trend comparison.
+const HANDS_RUNS: usize = 200;
+const TREND_RUNS: usize = 50;
+
+struct HandsView {
+    h: Hands,
+    runs: usize,
+    /// Fingers whose median moved the most between the previous `TREND_RUNS` runs and the
+    /// last ones: (finger, change in ms; negative is faster).
+    trend: Vec<(Finger, f64)>,
+}
+
+impl HandsView {
+    fn load(store: &Store) -> HandsView {
+        let runs = store.recent_runs(HANDS_RUNS).unwrap_or_default();
+        let n = runs.len();
+        let mut trend = Vec::new();
+        if n >= 2 * TREND_RUNS {
+            let now = hands::of_runs(&runs[n - TREND_RUNS..]);
+            let before = hands::of_runs(&runs[n - 2 * TREND_RUNS..n - TREND_RUNS]);
+            trend = hands::FINGERS
+                .iter()
+                .filter_map(|&f| Some((f, now.fingers[f.index()].ms? - before.fingers[f.index()].ms?)))
+                .filter(|(_, d)| d.abs() >= 3.0)
+                .collect();
+            trend.sort_by(|a, b| b.1.abs().total_cmp(&a.1.abs()));
+            trend.truncate(3);
+        }
+        HandsView { h: hands::of_runs(&runs), runs: n, trend }
+    }
 }
 
 struct Caret {
@@ -503,6 +539,8 @@ impl TheHill {
             selected,
             tags: Vec::new(),
             heat: Vec::new(),
+            on_hands: false,
+            hands: None,
         });
         self.select(selected, cx);
     }
@@ -694,6 +732,17 @@ impl TheHill {
             Screen::Stats(st) => {
                 let (selected, id) = (st.selected, st.checkpoints.get(st.selected).map(|c| c.id));
                 match ks.key.as_str() {
+                    "tab" => {
+                        st.on_hands ^= true;
+                        if st.on_hands && st.hands.is_none() {
+                            st.hands = Some(Box::new(HandsView::load(&self.session.store)));
+                        }
+                    }
+                    _ if st.on_hands => {
+                        if ks.key == "escape" {
+                            return self.new_run(cx);
+                        }
+                    }
                     "left" => return self.select(selected.saturating_sub(1), cx),
                     "right" => return self.select(selected + 1, cx),
                     "enter" => return self.choose_opponent(id, cx),
@@ -1056,6 +1105,13 @@ impl TheHill {
         if !slowest.is_empty() {
             insights = insights.child(row("slowest", slowest, pal().correct));
         }
+        if let Some(h) = &done.hands {
+            let mut items = vec![format!("left {:.0}ms", h.left_ms), format!("right {:.0}ms", h.right_ms)];
+            if let Some((f, ms)) = h.slowest {
+                items.push(format!("slowest finger: {} {ms:.0}ms", f.name()));
+            }
+            insights = insights.child(row("hands", items, pal().correct));
+        }
         if let Some((word, ms)) = &done.graph.lost {
             insights = insights.child(row("lost most on", vec![format!("{word} +{ms:.0}ms")], pal().correct));
         }
@@ -1183,7 +1239,44 @@ impl TheHill {
 
     fn render_stats(&self, width: f32, cx: &mut Context<Self>) -> impl IntoElement {
         let Screen::Stats(st) = &self.screen else { unreachable!() };
+        // `hands`: whether this tab is the hands page.
+        let tab = |id: &'static str, label: &'static str, hands: bool| {
+            div()
+                .id(id)
+                .cursor_pointer()
+                .text_color(color(if st.on_hands == hands { pal().accent } else { pal().untyped }))
+                .child(label)
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    let Screen::Stats(st) = &mut this.screen else { return };
+                    if st.on_hands != hands {
+                        st.on_hands = hands;
+                        if st.on_hands && st.hands.is_none() {
+                            st.hands = Some(Box::new(HandsView::load(&this.session.store)));
+                        }
+                        cx.notify();
+                    }
+                }))
+        };
+        let tabs = div()
+            .flex()
+            .gap(self.z(16.0))
+            .text_size(self.z(UI_SIZE))
+            .child(tab("tab-progress", "progress", false))
+            .child(tab("tab-hands", "hands", true));
+        if let (true, Some(v)) = (st.on_hands, &st.hands) {
+            return div()
+                .flex()
+                .flex_col()
+                .gap(self.z(28.0))
+                .child(tabs)
+                .child(self.render_hands(v, width))
+                .child(
+                    div().text_size(self.z(12.0)).text_color(color(pal().untyped)).child("tab progress   ·   esc back"),
+                )
+                .into_any_element();
+        }
         div()
+            .child(tabs)
             .flex()
             .flex_col()
             .gap(self.z(28.0))
@@ -1201,8 +1294,142 @@ impl TheHill {
                 div()
                     .text_size(self.z(12.0))
                     .text_color(color(pal().untyped))
-                    .child("← → choose   ·   enter play against it   ·   esc back"),
+                    .child("← → choose   ·   enter play against it   ·   tab hands   ·   esc back"),
             )
+            .into_any_element()
+    }
+
+    fn render_hands(&self, v: &HandsView, width: f32) -> impl IntoElement {
+        let h = &v.h;
+        let small = |text: String| div().text_size(self.z(12.0)).text_color(color(pal().untyped)).child(text);
+        let ms = |m: Option<f64>| m.map_or("-".to_string(), |m| format!("{m:.0}ms"));
+        let pct = |p: Option<f64>| p.map_or("-".to_string(), |p| format!("{:.1}%", p * 100.0));
+        if h.hands.iter().all(|s| s.ms.is_none()) {
+            return div()
+                .child(small("not enough typing yet. a few runs and this fills in.".into()))
+                .into_any_element();
+        }
+
+        // Left and right, side by side.
+        let hand = |side: usize, name: &str| {
+            let s = h.hands[side];
+            div().flex_1().flex().flex_col().child(self.stat(name, ms(s.ms), false)).child(small(format!(
+                "{} mistakes  ·  {:.0}% of letters, {:.0}% of the time",
+                pct(s.error_rate),
+                h.work[side] * 100.0,
+                h.time[side] * 100.0
+            )))
+        };
+        let hands_row = div().flex().gap(self.z(32.0)).child(hand(0, "left hand")).child(hand(1, "right hand"));
+
+        // Eight bars, taller = slower, redder = sloppier.
+        let known: Vec<f64> = h.fingers.iter().filter_map(|f| f.ms).collect();
+        let (lo, hi) = known.iter().fold((f64::MAX, f64::MIN), |(lo, hi), &m| (lo.min(m), hi.max(m)));
+        let errs: Vec<f64> = h.fingers.iter().filter_map(|f| f.error_rate).collect();
+        let (elo, ehi) = errs.iter().fold((f64::MAX, f64::MIN), |(lo, hi), &e| (lo.min(e), hi.max(e)));
+        let bar_h = 90.0 * self.zoom;
+        let col_w = ((width - 32.0 * self.zoom) / 8.0).min(90.0 * self.zoom);
+        let finger = |f: hands::Finger| {
+            let s = h.fingers[f.index()];
+            let t = s.ms.map_or(0.0, |m| if hi > lo { (m - lo) / (hi - lo) } else { 0.5 });
+            let e = s.error_rate.map_or(0.0, |e| if ehi > elo { (e - elo) / (ehi - elo) } else { 0.0 });
+            let height = bar_h * (0.25 + 0.75 * t as f32);
+            div()
+                .w(px(col_w))
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(self.z(4.0))
+                .child(
+                    div().h(px(bar_h)).flex().flex_col().justify_end().child(
+                        div()
+                            .w(px(col_w * 0.45))
+                            .h(px(height))
+                            .rounded(px(3.0 * self.zoom))
+                            .when(s.ms.is_some(), |d| d.bg(mix(pal().untyped, pal().error, e as f32)))
+                            .when(s.ms.is_none(), |d| d.border_1().border_color(color(pal().key_bg))),
+                    ),
+                )
+                .child(div().text_size(self.z(UI_SIZE)).text_color(color(pal().correct)).child(ms(s.ms)))
+                .child(small(pct(s.error_rate)))
+                .child(small(f.short().to_string()))
+        };
+        // Each hand's fingers under its heading.
+        let bars = div()
+            .flex()
+            .gap(self.z(32.0))
+            .child(div().flex_1().flex().items_end().children(hands::FINGERS[..4].iter().map(|&f| finger(f))))
+            .child(div().flex_1().flex().items_end().children(hands::FINGERS[4..].iter().map(|&f| finger(f))));
+
+        let mut headline = Vec::new();
+        if let Some((f, m)) = h.slowest() {
+            headline.push(format!("slowest: {} {m:.0}ms", f.name()));
+        }
+        if let Some((f, share)) = h.sloppiest() {
+            headline.push(format!("most mistakes: {} ({:.0}% of them)", f.name(), share * 100.0));
+        }
+
+        // Mistakes by kind, the usual mix-ups, and motions.
+        let line = |label: &str, value: String| {
+            div()
+                .flex()
+                .gap(self.z(12.0))
+                .child(
+                    div()
+                        .w(self.z(220.0))
+                        .flex_none()
+                        .whitespace_nowrap()
+                        .text_color(color(pal().untyped))
+                        .child(label.to_string()),
+                )
+                .child(div().text_color(color(pal().correct)).child(value))
+        };
+        let column = || div().flex_1().flex().flex_col().gap(self.z(6.0)).text_size(self.z(UI_SIZE));
+        let mut mistakes = column().child(small("your mistakes, by kind".into()));
+        for (slip, share) in h.slips.iter().take(5) {
+            mistakes = mistakes.child(line(slip.name(), format!("{:.0}%", share * 100.0)));
+        }
+        if !h.confusions.is_empty() {
+            let mixups: Vec<String> = h.confusions.iter().map(|(a, b, n)| format!("{a}→{b} {n}")).collect();
+            mistakes = mistakes.child(line("mixed up most", mixups.join("  ")));
+        }
+        let mut motions = column().child(small("motions".into()));
+        if let Some((same, other, _)) = h.same_finger {
+            motions = motions.child(line("same finger twice", format!("{same:.0}ms vs {other:.0}ms")));
+        }
+        if let Some((into_left, into_right)) = h.switch {
+            motions = motions.child(line("into your left hand", format!("{into_left:.0}ms")));
+            motions = motions.child(line("into your right hand", format!("{into_right:.0}ms")));
+        }
+        if let Some((inward, outward)) = h.rolls {
+            motions = motions.child(line("rolling inward", format!("{inward:.0}ms")));
+            motions = motions.child(line("rolling outward", format!("{outward:.0}ms")));
+        }
+        if !v.trend.is_empty() {
+            let moves: Vec<String> = v
+                .trend
+                .iter()
+                .map(|(f, d)| format!("{} {}{:.0}ms", f.name(), if *d < 0.0 { "−" } else { "+" }, d.abs()))
+                .collect();
+            motions = motions.child(line(&format!("last {TREND_RUNS} runs vs before"), moves.join("  ")));
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(self.z(24.0))
+            .child(hands_row)
+            .child(
+                div().flex().flex_col().gap(self.z(8.0)).child(bars).child(
+                    div().text_size(self.z(UI_SIZE)).text_color(color(pal().correct)).child(headline.join("  ·  ")),
+                ),
+            )
+            .child(div().flex().gap(self.z(32.0)).child(mistakes).child(motions))
+            .child(small(format!(
+                "last {} runs  ·  taller = slower, redder = more mistakes  ·  assumes standard touch-typing fingers",
+                v.runs
+            )))
+            .into_any_element()
     }
 
     fn render_lifetime(&self, life: &Lifetime) -> impl IntoElement {

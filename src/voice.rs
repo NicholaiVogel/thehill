@@ -66,6 +66,7 @@ pub struct RunFacts {
     pub checkpoint: Option<String>,
     pub boss: bool,
     pub memory: Option<Memory>,
+    pub hands: Option<crate::hands::RunHands>,
 }
 
 const COLD: &[&str] = &[
@@ -239,6 +240,61 @@ const BOSS_LOSE: &[&str] = &[
     "that's the wall. it'll be here next time too.",
 ];
 
+const BOSS_FINGER: &[&str] = &[
+    "boss run. your {f}: {ms}ms a key. 25 words of it.",
+    "this one's for your {f}. it knows why. {ms}ms a key, last i checked.",
+    "boss. i went through the dictionary looking for your {f}. found plenty.",
+    "every tenth run is mine. this one belongs to your {f}.",
+];
+
+const BOSS_SAME_FINGER: &[&str] = &[
+    "boss run. one finger, two keys in a row, over and over. {ms}ms extra every time.",
+    "25 words where the same finger has to go twice. you lose {ms}ms each time. i counted.",
+    "boss. ed, un, my, lo. same finger, back to back. all of it.",
+];
+
+const BOSS_HAND: &[&str] = &[
+    "boss run. 25 words for your {h} hand. {slow}ms a key against {fast} on the other.",
+    "this one's nearly all {h} hand. the other one can watch.",
+    "boss. your {h} hand is the slow one. so it gets the whole run.",
+    "every tenth run is mine. this one's {h}-handed.",
+];
+
+const HAND_SPLIT: &[&str] = &[
+    "left {l}ms a key, right {r}. your {slow} hand is the one i'm writing for.",
+    "your {fast} hand types. your {slow} hand catches up. {l} against {r}.",
+    "{slow} hand: {sms}ms a key. {fast} hand: {fms}. guess where the next words go.",
+    "two hands, one of them slower. {slow}, by {gapms}ms a key.",
+];
+
+const HAND_TIME: &[&str] = &[
+    "your {h} hand did {hw}% of the letters and took {ht}% of the time.",
+    "{hw}% of the letters, {ht}% of the time. that's your {h} hand.",
+];
+
+const SLOW_FINGER: &[&str] = &[
+    "{f}: {fgms}ms a key. slowest finger you own today.",
+    "your {f} took {fgms}ms a key. the others were waiting on it.",
+    "if i had to pick on one finger: {f}. {fgms}ms.",
+];
+
+const MIXUP: &[&str] = &[
+    "'{y}' for '{x}', {k} times. your fingers think they're the same key.",
+    "{x} and {y} again. {k} times this run.",
+    "you typed {y} when you meant {x}, {k} times. i keep a list.",
+];
+
+const RUSHED: &[&str] = &[
+    "{k} times you hit the next letter before this one. that's not speed, that's a guess.",
+    "you jumped ahead {k} times. the letters come in order. i checked.",
+    "{k} letters typed before their turn. patience is a typing skill too.",
+];
+
+const SAME_FINGER: &[&str] = &[
+    "same finger twice, {k} times. {xms}ms extra each. i planned that.",
+    "{k} times one finger had to do two keys in a row. {xms}ms extra each time. you're welcome.",
+];
+
 const MEMORY_FASTER: &[&str] = &[
     "'{w}': {then}ms a letter on {when}. {now} today. i remember.",
     "{when} you typed '{w}' at {then}ms a letter. {now} now. don't let it go to your head.",
@@ -402,6 +458,27 @@ impl Voice {
             if f.hour < 5 {
                 kinds.push(LATE);
             }
+            if let Some(h) = &f.hands {
+                let (slow, fast) = (h.left_ms.max(h.right_ms), h.left_ms.min(h.right_ms));
+                if slow >= fast * 1.12 {
+                    kinds.push(HAND_SPLIT);
+                }
+                if (h.left_time - h.left_work).abs() >= 0.08 {
+                    kinds.push(HAND_TIME);
+                }
+                if h.slowest.is_some() {
+                    kinds.push(SLOW_FINGER);
+                }
+                if h.confusion.is_some() {
+                    kinds.push(MIXUP);
+                }
+                if h.rushed >= 3 {
+                    kinds.push(RUSHED);
+                }
+                if h.same_finger.is_some_and(|(n, extra)| n >= 4 && extra >= 25.0) {
+                    kinds.push(SAME_FINGER);
+                }
+            }
             match outcome(f.wpm, f.predicted) {
                 _ if f.checkpoint.is_none() || f.predicted <= 0.0 => {}
                 std::cmp::Ordering::Greater => kinds.push(BEAT_OLD),
@@ -411,7 +488,7 @@ impl Voice {
             let kind = *kinds.choose(&mut self.rng)?;
             let template = self.pick(kind);
             let (pair, word) = (f.slowest, f.worst_word.as_ref());
-            let extra = [
+            let mut extra = vec![
                 ("a", pair.map(|p| key(p.0)).unwrap_or_default()),
                 ("b", pair.map(|p| key(p.1)).unwrap_or_default()),
                 ("ms", n(pair.filter(|_| kind == SLOW_PAIR).map(|p| p.2).or(word.map(|w| w.1)).unwrap_or(0.0))),
@@ -421,6 +498,42 @@ impl Voice {
                 ("hh", format!("{}am", if f.hour == 0 { 12 } else { f.hour })),
                 ("date", f.checkpoint.clone().unwrap_or_default()),
             ];
+            if let Some(h) = &f.hands {
+                let left_slower = h.left_ms >= h.right_ms;
+                let (slow, fast) = if left_slower { ("left", "right") } else { ("right", "left") };
+                // The hand whose share of the time is furthest from its share of the letters.
+                let (hand, work, time) = if h.left_time >= h.left_work {
+                    ("left", h.left_work, h.left_time)
+                } else {
+                    ("right", 1.0 - h.left_work, 1.0 - h.left_time)
+                };
+                let pct = |v: f64| format!("{:.0}", v * 100.0);
+                extra.extend([
+                    ("l", n(h.left_ms)),
+                    ("r", n(h.right_ms)),
+                    ("slow", slow.to_string()),
+                    ("fast", fast.to_string()),
+                    ("sms", n(h.left_ms.max(h.right_ms))),
+                    ("fms", n(h.left_ms.min(h.right_ms))),
+                    ("gapms", n((h.left_ms - h.right_ms).abs())),
+                    ("h", hand.to_string()),
+                    ("hw", pct(work)),
+                    ("ht", pct(time)),
+                    ("f", h.slowest.map(|s| s.0.name().to_string()).unwrap_or_default()),
+                    ("fgms", n(h.slowest.map_or(0.0, |s| s.1))),
+                    ("x", h.confusion.map(|c| c.0.to_string()).unwrap_or_default()),
+                    ("y", h.confusion.map(|c| c.1.to_string()).unwrap_or_default()),
+                    (
+                        "k",
+                        match kind {
+                            k if k == RUSHED => h.rushed.to_string(),
+                            k if k == SAME_FINGER => h.same_finger.map_or(0, |s| s.0).to_string(),
+                            _ => h.confusion.map_or(0, |c| c.2).to_string(),
+                        },
+                    ),
+                    ("xms", n(h.same_finger.map_or(0.0, |s| s.1))),
+                ]);
+            }
             Some(fill(&fill(template, &extra), &vals))
         });
         std::iter::once(verdict).chain(note).collect()
@@ -441,6 +554,19 @@ impl Voice {
         let (tag, count) = planted.unwrap_or_default();
         let vals = [("t", show(tag)), ("n", count.to_string()), ("w", hardest.unwrap_or_default().to_string())];
         fill(self.pick(kind), &vals)
+    }
+
+    pub fn boss_finger(&mut self, finger: &str, ms: f64) -> String {
+        fill(self.pick(BOSS_FINGER), &[("f", finger.to_string()), ("ms", format!("{ms:.0}"))])
+    }
+
+    pub fn boss_same_finger(&mut self, extra_ms: f64) -> String {
+        fill(self.pick(BOSS_SAME_FINGER), &[("ms", format!("{:.0}", extra_ms.max(0.0)))])
+    }
+
+    pub fn boss_hand(&mut self, hand: &str, slow_ms: f64, fast_ms: f64) -> String {
+        let vals = [("h", hand.to_string()), ("slow", format!("{slow_ms:.0}")), ("fast", format!("{fast_ms:.0}"))];
+        fill(self.pick(BOSS_HAND), &vals)
     }
 
     pub fn boss_preview(&mut self, tags: &[String]) -> String {
@@ -514,6 +640,16 @@ mod tests {
             runs_today: 25,
             hour: 2,
             checkpoint: Some("Nov 5".into()),
+            hands: Some(crate::hands::RunHands {
+                left_ms: 140.0,
+                right_ms: 112.0,
+                left_work: 0.55,
+                left_time: 0.66,
+                slowest: Some((crate::hands::Finger::LRing, 151.0)),
+                confusion: Some(('u', 'i', 3)),
+                rushed: 4,
+                same_finger: Some((6, 48.0)),
+            }),
             boss: false,
             memory: Some(Memory { word: "pueblo".into(), when: "Nov 5".into(), then_ms: 210.0, now_ms: 140.0 }),
         }
@@ -532,6 +668,20 @@ mod tests {
         let mut f = facts();
         f.personal_best = true;
         assert!(voice.results(&f)[1].contains("best"));
+        for line in
+            [voice.boss_finger("left ring", 151.0), voice.boss_same_finger(48.0), voice.boss_hand("left", 140.0, 112.0)]
+        {
+            assert!(!line.contains('{'), "{line}");
+        }
+    }
+
+    #[test]
+    fn the_hill_talks_about_your_hands() {
+        let mut voice = Voice::new(3, "");
+        let notes: Vec<String> = (0..300).map(|_| voice.results(&facts())[1].clone()).collect();
+        let about = |words: &[&str]| notes.iter().filter(|n| words.iter().any(|w| n.contains(w))).count();
+        assert!(about(&["hand"]) > 0 && about(&["left ring"]) > 0 && about(&["'i' for 'u'", "u and i"]) > 0);
+        assert!(notes.iter().any(|n| n.contains("140") && n.contains("112")), "hand lines use the run's numbers");
     }
 
     #[test]
